@@ -11,6 +11,8 @@ multiplier = 1
 multiplierstrength = 1
 mulstrshow = 10
 multraiser = 1
+clickpower = 1
+clicks = 0
 #-Variables - > UPGRADES.
 upgrade1cost = 10.0
 buyamount1 = 0
@@ -48,6 +50,7 @@ cry1booster = 1
 cry1upg4unlocked = False
 cry2booster = 1
 cry3unlocked = False
+cry4unlocked = False
 #-Variables - > Excess.
 mpower = 1
 currenttime = None
@@ -90,7 +93,7 @@ def pointcalc():
 #-Update UI.
 
 def updateui():
-    global mpower,multiplierstrength, multiplier, points, pointpersecond, upgrade1cost, buyamount1, upgrade2cost, buyamount2, upgrade3cost, buyamount3, mulstrshow, multraiser, rank1booster, rank6booster, cry1booster
+    global mpower,multiplierstrength, multiplier, points, pointpersecond, upgrade1cost, buyamount1, upgrade2cost, buyamount2, upgrade3cost, buyamount3, mulstrshow, multraiser, rank1booster, rank6booster, cry1booster, cry4unlocked, clickpower, clicks
     while True:
         #-Variable calculation.
         mulstrshow = (multiplierstrength * 100) - 100
@@ -124,6 +127,9 @@ def updateui():
             crystalinelabel.configure(text=f"Next: {crystallinedescriptions[crystallinetimes]} ({format_number(crystallinecost)} points)")
         else:
             crystalinelabel.configure(text="All crystallines complete!")
+        # Update click button text
+        if cry4unlocked:
+            clickbutton.configure(text=f"Gain {clickpower} points")
         tm.sleep(0.05)
 
 #-Definitions.
@@ -319,7 +325,8 @@ def crystalline():
                 if crystallinetimes == 3:
                     cry3unlocked = True
                     autobuythread.start()
-                    
+                if crystallinetimes == 4:
+                    cry4unlocked = True
                 points = 0
                 multiplier = 1
                 upgrade1cost = 10.0
@@ -442,7 +449,17 @@ upgrade4explain = tk.Label(window, text=f"Increases max level of upgrade 3 by {f
 upgrade4explain.grid(row=4, column=3, padx=5, pady=5)
 upgrade4explain.configure(width=35, height=1)
 
-                    
+
+#Clicking powers.
+def click_power():
+    global points, cry4unlocked, clickpower, clicks
+    if cry4unlocked:
+        clicks += clickpower
+
+clickbutton = tk.Button(window, text="???", command=click_power)
+clickbutton.grid(row=0, column=5, padx=5, pady=5)
+clickbutton.configure(bg="grey", fg="white", border=5, borderwidth=5)
+
 #-Admin window.
 
 #sets a currency to a value
@@ -532,7 +549,7 @@ def savewaiter():
 
 def save():
     with open("save.txt", "w") as f:
-        f.write(f"{points}:{pointpersecond}:{multiplier}:{multiplierstrength}:{mpower}:{upgrade1cost}:{buyamount1}:{upgrade2cost}:{buyamount2}:{upgrade3cost}:{buyamount3}:{multraiser}:{purifytimes}:{purifycost}:{rank1booster}:{rank2unlocked}:{rank3costmultiplier}:{rank3unlocked}:{rank4upg2booster}:{rank5upg3booster}:{rank6unlocked}:{rank6booster}:{upgrade1max}:{upgrade2max}:{upgrade3max}:{crystallineunlocked}:{crystallinetimes}:{crystallinecost}:{cry1booster}:{cry1upg4unlocked}:{cry2booster}:{cry3unlocked}")
+        f.write(f"{points}:{pointpersecond}:{multiplier}:{multiplierstrength}:{mpower}:{upgrade1cost}:{buyamount1}:{upgrade2cost}:{buyamount2}:{upgrade3cost}:{buyamount3}:{multraiser}:{purifytimes}:{purifycost}:{rank1booster}:{rank2unlocked}:{rank3costmultiplier}:{rank3unlocked}:{rank4upg2booster}:{rank5upg3booster}:{rank6unlocked}:{rank6booster}:{upgrade1max}:{upgrade2max}:{upgrade3max}:{crystallineunlocked}:{crystallinetimes}:{crystallinecost}:{cry1booster}:{cry1upg4unlocked}:{cry2booster}:{cry3unlocked}:{clickpower}:{clicks}")
     print(f"INFO: Saved at {currenttime}.")
 
 def load():
@@ -543,7 +560,7 @@ def load():
             global upgrade2cost, buyamount2, upgrade3cost, buyamount3, multraiser, purifytimes, purifycost
             global rank1booster, rank2unlocked, rank3costmultiplier, rank3unlocked, rank4upg2booster
             global rank5upg3booster, rank6unlocked, rank6booster, upgrade1max, upgrade2max, upgrade3max, crystallineunlocked, crystallinetimes, crystallinecost, cry1upg4unlocked, cry1booster
-            global cry2booster, cry3unlocked
+            global cry2booster, cry3unlocked, clickpower,clicks
             points = float(data[0])
             pointpersecond = float(data[1])
             multiplier = float(data[2])
@@ -576,6 +593,9 @@ def load():
             cry1upg4unlocked = data[29].lower() == "true"
             cry2booster = float(data[30])
             cry3unlocked = data[31].lower() == "true"
+            clickpower = float(data[32])
+            clicks = int(data[33])
+            print("INFO: Loaded save data.")
     except:
         print("No save file found or corrupted save.")
 
