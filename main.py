@@ -36,7 +36,8 @@ upgrade5complete = False
 purifytimes = 0
 maxpurify = 10
 purifycost = 1000
-purifydescriptions = ["Triples all point gain. For every purification afterwards, double all point gain.","For every purification, add one max level to upgrades 1 and 2.","For every purification, Reduce upgrades 1-3 cost by 5%","Increase upgrade 2 power by x3","Increase upgrade 3 power by +^0.01, making it ^0.06 per upgrade.","Gain (1+x)^2 x points, where x is the purification number.","No boost.","No boost. Maybe try again?","No boost. Next will be a new unlock, I promise.","Unlock Crystalline."]
+purifydescriptions = ["Triples all point gain. For every purification afterwards, double all point gain.","For every purification, add one max level to upgrades 1 and 2.","For every purification, Reduce upgrades 1-3 cost by 5%","Increase upgrade 2 power by x3","Increase upgrade 3 power by +^0.01, making it ^0.06 per upgrade.","Gain (1+x)^2 x points, where x is the purification number.","No boost.","No boost. Maybe try again?","No boost. Next will be a new unlock, I promise.","Unlock Crystalline.",
+                      "For every purification from now on, gain 2x clicks.","None.","None. x2","None. x3","Oh hey, the creator could be bothered to make something. Unlock crystalline 5."]
 rank1booster = 1
 rank2unlocked = False
 rank3unlocked = False
@@ -49,15 +50,18 @@ rank6booster = 1
 crystallineunlocked = False
 crystallinecost = 250000000
 crystallinetimes = 0
+maxcrystalline = 4
 crystallinedescriptions = ["Triple point gain. Unlocks the 4th point upgrade.", "Point gain is raised to the ^1.5 power.","Autobuy point upgrades 1-3.","Unlocks clicking power."]
 cry1booster = 1
 cry1upg4unlocked = False
 cry2booster = 1
 cry3unlocked = False
 cry4unlocked = False
+upgrade6complete = False
 #-Variables - > Excess.
 mpower = 1
 currenttime = None
+adminpanel = False
 #-Endings
 endings = ["K","M","B","T","Qa","Qi","Sx","Sp","Oc","No","Dc","Ud","Dd","Td","Qad","Qid","Sxd","Spd","Ocd","Nod","Vg"]
 #-Formatting
@@ -97,7 +101,9 @@ def pointcalc():
 #-Update UI.
 
 def updateui():
-    global mpower,multiplierstrength, multiplier, points, pointpersecond, upgrade1cost, buyamount1, upgrade2cost, buyamount2, upgrade3cost, buyamount3, mulstrshow, multraiser, rank1booster, rank6booster, cry1booster, cry4unlocked, clickpower, clicks, maxpurify
+    global mpower,multiplierstrength, multiplier, points, pointpersecond, upgrade1cost, buyamount1, upgrade2cost, buyamount2, upgrade3cost
+    global buyamount3, mulstrshow, multraiser, rank1booster, rank6booster, cry1booster, cry4unlocked, clickpower, clicks, maxpurify
+    global crystallinetimes, maxcrystalline
     while True:
         #-Variable calculation.
         mulstrshow = (multiplierstrength * 100) - 100
@@ -106,7 +112,10 @@ def updateui():
         multraiser = round(multraiser, 2)
         mpower = ((rank1booster * rank6booster) * (multiplierstrength * multiplier) * cry1booster) ** cry2booster 
         mpower = round(mpower, 2)
-        clickpower = round(((ma.log2(points / 1e15) / (2+ma.log10(clickpower)))),2)
+        if points > 1e15:
+            clickpower = round(((ma.log2(points / 1e15) / (2+ma.log10(clickpower)))),2)
+        else:
+            clickpower = 1
         #UPGRADE 1
         upgrade1label.configure(text=f"{format_number(upgrade1cost)} points")
         pointlabel.configure(text=f"Current points: {format_number(points)}")
@@ -129,11 +138,14 @@ def updateui():
         elif purifytimes == maxpurify:
             purificationlabel.configure(text="Maximum purifications completed!")
         # Update crystalline label with current description
-        if crystallinetimes < len(crystallinedescriptions):
+        if crystallinetimes < len(crystallinedescriptions) and maxcrystalline >= crystallinetimes:
             crystalinelabel.configure(text=f"Next: {crystallinedescriptions[crystallinetimes]} ({format_number(crystallinecost)} points)")
+        elif crystallinetimes < len(crystallinedescriptions) and maxcrystalline < crystallinetimes:
+            crystalinelabel.configure(text="Maximum crystallines complete!")
         else:
             crystalinelabel.configure(text="All crystallines complete!")
-        # Update click button text
+            
+        # Update click button text - UPG 5
         if cry4unlocked:
             clickbutton.configure(text=f"Gain {clickpower} click power [C]")
             clicklabel.configure(text=f"Clicks: {format_number(clicks)}")
@@ -218,9 +230,10 @@ def purify():
     global points, purifytimes, purifycost, multiplier, multiplierstrength, upgrade1cost, upgrade2cost
     global upgrade3cost, buyamount1, buyamount2, buyamount3, multraiser, rank1booster, rank2unlocked
     global rank3costmultiplier, rank4upg2booster, rank5upg3booster, upgrade1max, upgrade2max, upgrade3max, rank3unlocked, rank6unlocked,rank6booster, crystallineunlocked
+    global maxpurify
 
     if points >= purifycost:
-        if purifytimes < len(purifydescriptions):
+        if purifytimes < len(purifydescriptions) or maxpurify == purifytimes:
             points -= purifycost
 
             # Apply purification effects based on rank
@@ -266,6 +279,8 @@ def purify():
             multraiser = 1
 
             purifycost = round(purifycost * (3+purifytimes), 2)
+            if purifytimes == 9:
+                purifycost == 1e15
             purifytimes += 1
             print(f"INFO: Purified! Current purification times: {purifytimes}")
         else:
@@ -330,10 +345,10 @@ def crystalline():
     global upgrade3cost, buyamount1, buyamount2, buyamount3, multraiser, rank1booster, rank2unlocked
     global rank3costmultiplier, rank4upg2booster, rank5upg3booster, upgrade1max, upgrade2max, upgrade3max
     global rank3unlocked, rank6unlocked, rank6booster, crystallineunlocked, crystallinetimes, cry1booster, cry1upg4unlocked
-    global cry2booster, cry3unlocked, crystallinecost,upgrade4cost, buyamount4,upgrade4max, cry4unlocked
+    global cry2booster, cry3unlocked, crystallinecost,upgrade4cost, buyamount4,upgrade4max, cry4unlocked, maxcrystalline
     if crystallineunlocked:
         if points >= crystallinecost:
-            if crystallinetimes < len(crystallinedescriptions):
+            if crystallinetimes < len(crystallinedescriptions) or maxcrystalline == crystallinetimes:
                 points -= crystallinecost
                 crystallinetimes += 1
                 if crystallinetimes == 1:
@@ -372,9 +387,11 @@ def crystalline():
                 rank5upg3booster = 0
                 rank6unlocked = False
                 rank6booster = 1
-
                 crystallineunlocked = False
                 crystallinecost *= (10+((crystallinetimes+1)**2))
+                if crystallinetimes == 4:
+                    crystallinecost = 1e20
+
                 print(f"INFO: Crystallized! Current crystalline times: {crystallinetimes}")
             else:
                 warn.warn("WARNING: All crystallines completed!")
@@ -390,14 +407,26 @@ def upgrade5():
     global clicks, maxpurify, upgrade5complete
     if clicks >= 1000:
         if not upgrade5complete:
+            clicks -= 1000
             maxpurify = 15
             upgrade5complete = True
             print("INFO: Upgrade 5 complete!")
         else:
-            warn.warn("WARNING: Upgrade 5 already complete!")
+            warn.warn("WARNING: Upgrade 5 already bought!")
     else: 
         warn.warn("WARNING: Not enough click power to upgrade.")
-    
+
+#-Upgrade 6
+
+def upgrade6():
+    global clicks, upgrade6complete, maxcrystalline
+    if not upgrade6complete:
+        if clicks >= 100000:
+            maxcrystalline == 5
+        else:
+            warn.warn("WARNING: You cannot afford this!")
+    else:
+        warn.warn("WARNING: You have already bought this!")
 #-Currency labels.
 
 pointlabel = tk.Label(window, text=f"Current points: {points}")
@@ -516,12 +545,13 @@ clickbutton.configure(bg="grey", fg="white", border=5, borderwidth=5)
 #sets a currency to a value
 
 def setcurrency():
-    global points
-    try:
-        points = float(setcurrencyentry.get())
-        print(f"INFO: Set currency to {points}")
-    except ValueError:
-        warn.warn("WARNING: Invalid value.")
+    global points, adminpanel
+    if adminpanel:
+        try:
+            points = float(setcurrencyentry.get())
+            print(f"INFO: Set currency to {points}")
+        except ValueError:
+            warn.warn("WARNING: Invalid value.")
 
 setcurrencyentry = tk.Entry(adminwindow, width=10)
 setcurrencyentry.grid(row=0, column=0, padx=5, pady=5)
@@ -532,12 +562,13 @@ setcurrencybutton.grid(row=0, column=1, padx=5, pady=5)
 setcurrencybutton.configure(bg="grey", fg="white", border=5, borderwidth=5)
 
 def setpurification():
-    global purifytimes
-    try:
-        purifytimes = int(setpurificationentry.get())
-        print(f"INFO: Set purification times to {purifytimes}")
-    except ValueError:
-        warn.warn("WARNING: Invalid value.")
+    global purifytimes, adminpanel
+    if adminpanel:
+        try:
+            purifytimes = int(setpurificationentry.get())
+            print(f"INFO: Set purification times to {purifytimes}")
+        except ValueError:
+            warn.warn("WARNING: Invalid value.")
 
 setpurificationentry = tk.Entry(adminwindow, width=10)
 setpurificationentry.grid(row=1, column=0, padx=5, pady=5)
@@ -598,7 +629,7 @@ def savewaiter():
 
 def save():
     with open("save.txt", "w") as f:
-        f.write(f"{points}:{pointpersecond}:{multiplier}:{multiplierstrength}:{mpower}:{upgrade1cost}:{buyamount1}:{upgrade2cost}:{buyamount2}:{upgrade3cost}:{buyamount3}:{multraiser}:{purifytimes}:{purifycost}:{rank1booster}:{rank2unlocked}:{rank3costmultiplier}:{rank3unlocked}:{rank4upg2booster}:{rank5upg3booster}:{rank6unlocked}:{rank6booster}:{upgrade1max}:{upgrade2max}:{upgrade3max}:{crystallineunlocked}:{crystallinetimes}:{crystallinecost}:{cry1booster}:{cry1upg4unlocked}:{cry2booster}:{cry3unlocked}:{clickpower}:{clicks}:{buyamount4}:{upgrade4cost}:{cry4unlocked}")
+        f.write(f"{points}:{pointpersecond}:{multiplier}:{multiplierstrength}:{mpower}:{upgrade1cost}:{buyamount1}:{upgrade2cost}:{buyamount2}:{upgrade3cost}:{buyamount3}:{multraiser}:{purifytimes}:{purifycost}:{rank1booster}:{rank2unlocked}:{rank3costmultiplier}:{rank3unlocked}:{rank4upg2booster}:{rank5upg3booster}:{rank6unlocked}:{rank6booster}:{upgrade1max}:{upgrade2max}:{upgrade3max}:{crystallineunlocked}:{crystallinetimes}:{crystallinecost}:{cry1booster}:{cry1upg4unlocked}:{cry2booster}:{cry3unlocked}:{clickpower}:{clicks}:{buyamount4}:{upgrade4cost}:{cry4unlocked}:{maxcrystalline}:{upgrade5complete}:{upgrade6complete}")
     print(f"INFO: Saved at {currenttime}.")
 
 def load():
@@ -609,7 +640,7 @@ def load():
             global upgrade2cost, buyamount2, upgrade3cost, buyamount3, multraiser, purifytimes, purifycost
             global rank1booster, rank2unlocked, rank3costmultiplier, rank3unlocked, rank4upg2booster
             global rank5upg3booster, rank6unlocked, rank6booster, upgrade1max, upgrade2max, upgrade3max, crystallineunlocked, crystallinetimes, crystallinecost, cry1upg4unlocked, cry1booster, buyamount4, upgrade4cost, cry4unlocked
-            global cry2booster, cry3unlocked, clickpower,clicks
+            global cry2booster, cry3unlocked, clickpower,clicks, maxcrystalline, upgrade5complete, upgrade6complete
             points = float(data[0])
             pointpersecond = float(data[1])
             multiplier = float(data[2])
@@ -647,6 +678,9 @@ def load():
             buyamount4 = int(data[34])
             upgrade4cost = float(data[35])
             cry4unlocked = data[36].lower() == "true"
+            maxcrystalline = int(data[37])
+            upgrade5complete = data[38].lower() == "true"
+            upgrade6complete = data[39].lower() == "true"
             print("INFO: Loaded save data.")
     except:
         print("No save file found or corrupted save.")
