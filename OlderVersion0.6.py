@@ -1,4 +1,4 @@
-#WARNING FOR FUTURE ME: TO USE THE CUSTOM STYLE DO pip install ttkbootstrap DO NOT COMPLAIN IF YOU ARE AN IDIOT!!!!
+#WARNING FOR USERS: TO USE THE CUSTOM STYLE DO pip install ttkbootstrap DO NOT COMPLAIN IF YOU ARE AN IDIOT!!!!
 
 #-Imports.
 import tkinter as tk
