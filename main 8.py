@@ -22,7 +22,7 @@ from tkinter import messagebox
 try:
     from ttkbootstrap.scrolled import ScrolledText as ttkScrolledText
 except ImportError:
-    ttkScrolledText = scrolledtext.ScrolledText # Fallback
+    ttkScrolledText = scrolledtext.ScrolledText 
 
 # --- Configuration ---
 SAVE_FILE = "save_encoded.dat" # New save file for major changes
@@ -31,16 +31,16 @@ SAVE_VERSION = 31 # Incremented for fixes/updates
 UPDATE_INTERVAL_MS = 100
 TICK_INTERVAL_S = 0.1
 AUTOSAVE_INTERVAL_S = 30
-DEVELOPER_MODE = True # Keep True for testing new features
+DEVELOPER_MODE = False
 POINT_THRESHOLD_SP = 1e24
-RELIC_MAX_LEVEL = 10 # Task 1: Max level for all relics
+RELIC_MAX_LEVEL = 10 
 
 # --- Logging Setup ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8'), # Specify encoding
+        logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8'), 
         logging.StreamHandler(sys.stdout)
     ]
 )
