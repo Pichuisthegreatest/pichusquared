@@ -31,7 +31,8 @@ SAVE_VERSION = 31 # Incremented for fixes/updates
 UPDATE_INTERVAL_MS = 100
 TICK_INTERVAL_S = 0.1
 AUTOSAVE_INTERVAL_S = 30
-DEVELOPER_MODE = False
+ADMINPANELACTIVATION = False #access to admin panel :3
+DEVELOPER_MODE = False #debug
 POINT_THRESHOLD_SP = 1e24
 RELIC_MAX_LEVEL = 10 
 
@@ -151,7 +152,7 @@ class GameState:
         self.asc_unl = False # ascension_unlocked
         self.asc_cnt = 0 # ascension_count
         self.sd = 0.0 # stardust
-        self.asc_cost = 1e48 # ascension_cost
+        self.asc_cost = 1e27 # ascension_cost
         self.asc_lvl = 0 # NEW: Ascension Level
         self.asc_xp = 0.0 # NEW: Ascension Experience
         self.asc_first = False # NEW: has_ascended_once
@@ -828,7 +829,7 @@ def upgrade4():
 
 def upgrade5(): # Click Upg
     global clicks, g
-    req = 1000.0
+    req = 100.0
     if not g.cr4_unl or g.upg5_comp: return # Use cr4_unl, upg5_comp
     if clicks >= req:
         # clicks -= req # Typically click upgrades don't consume clicks? Keep if intended.
@@ -1236,10 +1237,6 @@ def ascend():
     g.sd += sd_gain
     g.asc_xp += xp_gain # Add XP
     g.asc_cnt += 1
-    try:
-        g.asc_cost *= 100 # Increase cost for next ascension
-    except OverflowError:
-        g.asc_cost = float('inf')
 
     # Set flag for first ascension (Task 3)
     if not g.asc_first:
@@ -2138,10 +2135,6 @@ def updateui():
         # Delay rescheduling slightly on error to prevent rapid error loops
         if is_running: window.after(UPDATE_INTERVAL_MS * 5, updateui)
 
-
-# --- Admin Panel ---
-# (Admin panel code from previous response goes here)
-# --- Admin Panel Globals ---
 admin_window = None
 admin_widgets = {}
 active_admin_threads = [] # Stores TIDs of running background commands
@@ -2150,235 +2143,379 @@ active_admin_threads = [] # Stores TIDs of running background commands
 
 def log_to_admin_output_threadsafe(m):
     """Safely logs a message to the admin output widget from any thread."""
+    # Assumes 'window' is the main tk root window defined elsewhere
     if admin_widgets.get('cmd_output') and window and is_running:
         try:
+            # Use window.after to schedule the UI update on the main thread
             window.after(0, lambda msg=m: log_to_admin_output(msg))
-        except Exception: pass
+        except Exception: pass # Ignore if window/tk is gone
 
 def _execute_single_command(cmd_str, log_output=True):
     """Executes a single admin command string. Internal use."""
-    global is_running, COMMAND_HANDLERS
+    global is_running, COMMAND_HANDLERS # Need handlers dict
     if not cmd_str or not is_running: return None
+
     parts = cmd_str.split()
     cmd = parts[0].lower()
     args = parts[1:]
     res = None
     handler_data = COMMAND_HANDLERS.get(cmd)
+
     if handler_data:
         try:
+            # Call the function associated with the command
             func = handler_data['func']
-            res = func(args)
+            res = func(args) # Pass the arguments list
         except Exception as e:
             res = f"Exec Error '{cmd}': {e}"
             logging.error(f"Admin cmd '{cmd}' error: {e}", exc_info=True)
     else:
         res = f"Unknown command: '{cmd}'."
+
+    # Log the result unless it's a background task or logging is off
+    # Check if the function is one known to run in the background
     background_funcs = [cmd_wait, cmd_repeat, cmd_while]
     should_log = log_output and res and (handler_data is None or handler_data['func'] not in background_funcs)
+
     if should_log:
+        # Ensure logging happens on the main thread if needed
         log_to_admin_output_threadsafe(str(res))
-    return res
+    return res # Return result for potential chaining or internal use
 
 def _evaluate_condition(cond_str):
     """Evaluates a simple condition string 'var op val'. Internal use."""
-    global points, clicks, g
+    global points, clicks, g # Need access to game state
     try:
         parts = cond_str.split()
         if len(parts) != 3: raise ValueError("Condition must be 'var op val'")
         var, op, val_str = parts[0].lower(), parts[1], parts[2]
+
         current_value = None
+        value_source = None
+
+        # Check globals first
         if var in ['points', 'clicks', 'pps']:
             current_value = globals().get(var)
+            value_source = "Global"
+        # Check GameState 'g'
         elif hasattr(g, var):
             current_value = getattr(g, var)
+            value_source = "GameState"
         else:
             raise NameError(f"Variable '{var}' not found.")
-        if current_value is None: current_value = 0
+
+        if current_value is None:
+            # Treat None as 0 for comparisons, might need adjustment
+            current_value = 0
+
+        # Determine the type for comparison
         target_type = type(current_value)
         compare_value = None
+
+        # Convert val_str to the appropriate type
         try:
-            if target_type == bool: compare_value = val_str.lower() in ['true', '1', 't', 'y']
-            elif target_type == int: compare_value = int(float(val_str))
-            elif target_type == float: compare_value = float(val_str)
-            elif target_type == str: compare_value = val_str
-            elif isinstance(current_value, (int, float)): compare_value = float(val_str)
-            else: raise TypeError(f"Unsupported type '{target_type.__name__}' for comparison.")
-        except ValueError: raise TypeError(f"Cannot convert '{val_str}' to expected type '{target_type.__name__}'.")
+            if target_type == bool:
+                compare_value = val_str.lower() in ['true', '1', 't', 'y']
+            elif target_type == int:
+                compare_value = int(float(val_str)) # Allow scientific notation
+            elif target_type == float:
+                compare_value = float(val_str)
+            elif target_type == str:
+                compare_value = val_str
+            elif isinstance(current_value, (int, float)): # Handle cases where type is int/float but loaded differently
+                 compare_value = float(val_str)
+            else:
+                raise TypeError(f"Unsupported type '{target_type.__name__}' for comparison.")
+        except ValueError:
+             raise TypeError(f"Cannot convert '{val_str}' to expected type '{target_type.__name__}'.")
+
+
+        # Perform comparison
         if op == '==': return current_value == compare_value
         elif op == '!=': return current_value != compare_value
+        # Numerical comparisons require numbers
         elif isinstance(current_value, (int, float)) and isinstance(compare_value, (int, float)):
             if op == '>': return current_value > compare_value
             elif op == '<': return current_value < compare_value
             elif op == '>=': return current_value >= compare_value
             elif op == '<=': return current_value <= compare_value
             else: raise ValueError(f"Unsupported operator '{op}' for numbers.")
-        elif op in ['>', '<', '>=', '<=']: raise TypeError(f"Operator '{op}' requires numerical types (got {target_type.__name__}).")
-        else: raise ValueError(f"Unsupported operator '{op}'.")
+        elif op in ['>', '<', '>=', '<=']: # Tried numerical op on non-numerical type
+            raise TypeError(f"Operator '{op}' requires numerical types (got {target_type.__name__}).")
+        else:
+            raise ValueError(f"Unsupported operator '{op}'.")
+
     except Exception as e:
         log_to_admin_output_threadsafe(f"Condition Error: {e}")
         logging.warning(f"Condition eval error '{cond_str}': {e}")
-        return False
+        return False # Default to False on any error
 
 # --- Admin Command Functions ---
-def cmd_setvalue(args):
-    global points, clicks, g
+
+def cmd_setvalue(args): # Updated for 'g' and new vars
+    global points, clicks, g # Use 'g'
     if len(args)!=2: return "Usage: set <var> <val>"
     var,val_str=args[0].lower(),args[1]
     tgt=None
-    is_g=False
+    is_g=False # Is it a global variable like points/clicks?
     cur=None
     old=None
-    if var in ['points', 'clicks', 'pps', 'is_running']:
-        tgt=globals(); is_g=True; cur=tgt.get(var); old=cur
+
+    # Check globals first
+    if var in ['points', 'clicks', 'pps', 'is_running']: # Add other globals if needed
+        tgt=globals()
+        is_g=True
+        cur=tgt.get(var) # Use get for safety
+        old=cur
+    # Check GameState 'g' attributes
     elif hasattr(g, var):
-        tgt=g; cur=getattr(g, var); old=cur
-    else: return f"Error: Var '{var}' not found."
-    if cur is None and not is_g: logging.warning(f"Var '{var}' exists but is None. Attempting set.")
-    tp=type(cur) if cur is not None else None
+        tgt=g
+        cur=getattr(g, var)
+        old=cur
+    else: return f"Error: Var '{var}' not found in globals or game state."
+
+    if cur is None and not is_g: # Safety check if getattr returned None unexpectedly
+        # Allow setting None values if needed, maybe? For now, assume we want a type.
+         logging.warning(f"Var '{var}' exists but is None. Attempting to set anyway.")
+         # pass
+
+    tp=type(cur) if cur is not None else None # Get type from current value if possible
     new=None
+
     try:
-        if var in ['asc_first','p20_lim_brk','upg5_comp','upg6_comp','cryst_unl','asc_unl','r2_unl','r3_unl','r6_unl','cr1_u4_unl','cr3_unl','cr4_unl','cr5_comp','p12_auto_u4']: new = val_str.lower() in ['true', '1', 't', 'y']; tp = bool
-        elif var in ['asc_lvl','asc_cnt','pur_cnt','cryst_cnt','upg1_lvl','upg2_lvl','upg3_lvl','upg4_lvl','upg7_lvl','upg8_lvl']: new = int(float(val_str)); tp = int
+        # Explicit type checks for known state variables
+        if var in ['asc_first', 'p20_lim_brk', 'upg5_comp', 'upg6_comp', 'cryst_unl', 'asc_unl', 'r2_unl', 'r3_unl', 'r6_unl', 'cr1_u4_unl', 'cr3_unl', 'cr4_unl', 'cr5_comp', 'p12_auto_u4']:
+             new = val_str.lower() in ['true', '1', 't', 'y']; tp = bool
+        elif var in ['asc_lvl', 'asc_cnt', 'pur_cnt', 'cryst_cnt', 'upg1_lvl', 'upg2_lvl', 'upg3_lvl', 'upg4_lvl', 'upg7_lvl', 'upg8_lvl']:
+            new = int(float(val_str)); tp = int
         elif var in ['upg1_max','upg2_max','upg3_max','upg4_max','upg7_max','upg8_max']: # Handle float max levels
             if val_str.lower() in ['inf', 'infinity']: new = float('inf'); tp = float
             else: new = float(val_str); tp = float
-        elif var in ['asc_xp','sd','pps_exp','clk_pow','mult','mult_str','r1_boost','r3_cost_m','r4_u2_boost','r5_u3_boost','r6_boost','cr1_boost','cr2_boost','cryst_comp_bonus','p11_pps_boost','p14_u2_boost','p16_cost_reduc','p17_u1_boost','p18_pass_clk','p19_boost','p24_pur_cost_div','chal_sd_boost','chal_perm_clk_boost','chal_upg_cost_scale_mult','points','clicks','pps','upg1_cost','upg2_cost','upg3_cost','upg4_cost','upg7_cost','upg8_cost','pur_cost','cryst_cost','asc_cost','auto_cps','clk_pt_scale','pps_pt_scale_exp','chal_eff_pps_exp_mod','chal_eff_cost_exp_mod','clk_crit_c','clk_crit_m']: new = float(val_str); tp = float
-        elif var == 'active_chal': new = None if val_str.lower() == 'none' else val_str; tp = str if new is not None else type(None)
-        elif var in ['relic_lvls', 'chal_comps']: new = ast.literal_eval(val_str); assert isinstance(new, dict); tp = dict
+        elif var in ['asc_xp', 'sd', 'pps_exp', 'clk_pow', 'mult', 'mult_str', 'r1_boost', 'r3_cost_m', 'r4_u2_boost', 'r5_u3_boost', 'r6_boost', 'cr1_boost', 'cr2_boost', 'cryst_comp_bonus', 'p11_pps_boost', 'p14_u2_boost', 'p16_cost_reduc', 'p17_u1_boost', 'p18_pass_clk', 'p19_boost', 'p24_pur_cost_div', 'chal_sd_boost', 'chal_perm_clk_boost', 'chal_upg_cost_scale_mult', 'points', 'clicks', 'pps', 'upg1_cost', 'upg2_cost', 'upg3_cost', 'upg4_cost', 'upg7_cost', 'upg8_cost', 'pur_cost', 'cryst_cost', 'asc_cost', 'auto_cps', 'clk_pt_scale', 'pps_pt_scale_exp', 'chal_eff_pps_exp_mod', 'chal_eff_cost_exp_mod', 'clk_crit_c', 'clk_crit_m']:
+            new = float(val_str); tp = float
+        elif var == 'active_chal': # Handle setting active_chal to None
+            new = None if val_str.lower() == 'none' else val_str
+            tp = str if new is not None else type(None)
+        elif var in ['relic_lvls', 'chal_comps']:
+            new = ast.literal_eval(val_str) # Use literal_eval for safety
+            if not isinstance(new, dict): raise TypeError("Parsed value is not a dict")
+            tp = dict
+        # Fallback for other types or unknown variables
         elif tp is not None:
             if tp == bool: new=val_str.lower() in ['true','1','t','y']
             elif tp == int: new=int(float(val_str))
             elif tp == float: new=float(val_str)
             elif tp == str: new=val_str
-            elif tp == dict: new=ast.literal_eval(val_str); assert isinstance(new,dict)
-            else: raise TypeError(f"Unsupported type '{tp.__name__}'.")
-        else:
+            elif tp == dict:
+                 new=ast.literal_eval(val_str)
+                 if not isinstance(new,dict): raise TypeError("Parsed value is not a dict")
+            # Add list, set etc. if needed
+            else: raise TypeError(f"Unsupported type '{tp.__name__}' for auto-conversion.")
+        else: # Type is None (variable might not have been initialized yet or was None)
+            # Attempt literal_eval or default to string
             try: new = ast.literal_eval(val_str); tp = type(new)
             except: new = val_str; tp = str
-            log_to_admin_output_threadsafe(f"Warning: Type for '{var}' was None, guessed '{tp.__name__}'.")
-    except Exception as e: return f"Error parsing '{val_str}' for {var}: {e}"
+            log_to_admin_output_threadsafe(f"Warning: Type for '{var}' was None, guessed type '{tp.__name__}'.")
+
+    except Exception as e: return f"Error parsing '{val_str}' for {var} (Expected ~{tp.__name__ if tp else 'Unknown'}): {e}"
+
+    # Apply the change
     if is_g: globals()[var]=new
     else: setattr(tgt, var, new)
+
     buff_msg=""
+    # Apply buffs if prestige counts increased (check correct vars: pur_cnt, cryst_cnt)
     if not is_g and var in ['pur_cnt','cryst_cnt'] and isinstance(old,(int,float)) and isinstance(new,int) and new>old:
         try:
             old_i,new_i=int(old),int(new)
             if new_i>old_i:
-                log_to_admin_output_threadsafe(f"ADMIN: Applying buffs {var} {old_i+1}..{new_i}")
+                log_to_admin_output_threadsafe(f"ADMIN: Applying buffs for {var} from {old_i+1} to {new_i}")
                 if var=='pur_cnt':
                     for i in range(old_i,new_i): apply_purification_effects(i)
                     buff_msg=" P buffs applied."
                 elif var=='cryst_cnt':
-                    for i in range(old_i,new_i): apply_crystalline_effects(i+1)
+                    for i in range(old_i,new_i): apply_crystalline_effects(i+1) # Cryst levels are 1-based
                     buff_msg=" C buffs applied."
         except Exception as e:
             log_to_admin_output_threadsafe(f"Buff Error: {e}")
             logging.error(f"Buff Error: {e}",exc_info=True)
-    needs_recalc = True
-    vars_no_recalc_g = ['is_running']
-    vars_no_recalc_gs = ['last_save_time','admin_panel_active', 'playtime']
+
+    # Determine if recalculation is needed
+    needs_recalc = True # Default to true
+    vars_no_recalc_g = ['is_running'] # Globals not needing recalc
+    vars_no_recalc_gs = ['last_save_time','admin_panel_active', 'playtime'] # GS vars not needing recalc
+
     if is_g and var in vars_no_recalc_g: needs_recalc = False
     if not is_g and var in vars_no_recalc_gs: needs_recalc = False
-    if var in ['asc_lvl', 'asc_xp'] and not is_g: needs_recalc = False; g.check_ascension_level_up()
-    if var == 'active_chal' and not is_g: needs_recalc = True
+    # Special case: If setting asc_lvl/xp, level up check handles recalc
+    if var in ['asc_lvl', 'asc_xp'] and not is_g:
+         needs_recalc = False # check_ascension_level_up will trigger recalc if needed
+         g.check_ascension_level_up()
+    # Special case: Setting active_chal might need recalc depending on challenge effects
+    if var == 'active_chal' and not is_g:
+        needs_recalc = True # Assume recalc needed to apply/remove challenge effects
+
+
     res=f"Set {var} to {new!r}."
     if needs_recalc:
         recalculate_derived_values()
         res+=" Recalculated."+buff_msg
-    elif buff_msg:
-        recalculate_derived_values()
+    elif buff_msg: # Buffs were applied, but recalc wasn't needed for the set var itself
+        recalculate_derived_values() # Still need recalc for buff effect
         res+=buff_msg + " Recalculated (for buffs)."
+
     return res
 
-def cmd_varinfo(args):
+
+def cmd_varinfo(args): # Updated for 'g'
     global g
     if len(args)!=1: return "Usage: get <var>"
     var=args[0].lower()
-    val=None; tp=None; source = "Not Found"
-    if var in globals(): val=globals().get(var); source = "Global"
-    elif hasattr(g, var): val=getattr(g, var); source = "GameState"
+    val=None
+    tp=None
+    source = "Not Found"
+    if var in globals():
+        val=globals().get(var)
+        source = "Global"
+    elif hasattr(g, var):
+        val=getattr(g, var)
+        source = "GameState"
     else: return f"Error: Var '{var}' not found."
-    tp=type(val).__name__
-    return f"{var} ({tp}) [{source}] = {val!r}"
 
-def cmd_list(args):
-    global points, clicks, pps, g
+    tp=type(val).__name__
+    # Format inf/nan nicely
+    if isinstance(val, float):
+        if ma.isinf(val): val_repr = "Infinity" if val > 0 else "-Infinity"
+        elif ma.isnan(val): val_repr = "NaN"
+        else: val_repr = repr(val)
+    else: val_repr = repr(val)
+    return f"{var} ({tp}) [{source}] = {val_repr}"
+
+
+def cmd_list(args): # Updated for 'g', 'pps'
+    global points, clicks, pps, g # Use 'g', 'pps'
     if len(args)==0:
         lines=["--- Game State (g) ---"]
+        # Sort attributes for consistent output
         for k,v in sorted(vars(g).items()):
-             if not k.startswith('_'): lines.append(f"  {k} ({type(v).__name__}) = {v!r}")
+             if not k.startswith('_'):
+                 # Format inf/nan nicely
+                 if isinstance(v, float):
+                     if ma.isinf(v): v_repr = "Infinity" if v > 0 else "-Infinity"
+                     elif ma.isnan(v): v_repr = "NaN"
+                     else: v_repr = repr(v)
+                 else: v_repr = repr(v)
+                 lines.append(f"  {k} ({type(v).__name__}) = {v_repr}")
         lines.append("\n--- Globals ---")
-        lines.append(f"  points={points!r}")
-        lines.append(f"  clicks={clicks!r}")
-        lines.append(f"  pps={pps!r}")
-        lines.append(f"  is_running={is_running!r}")
+        lines.append(f"  points={repr(points)}")
+        lines.append(f"  clicks={repr(clicks)}")
+        lines.append(f"  pps={repr(pps)}") # Corrected global var name
+        lines.append(f"  is_running={repr(is_running)}")
         return "\n".join(lines)
     elif len(args)==1: return cmd_varinfo(args)
     else: return "Usage: list [<var>]"
 
-def cmd_type(args):
+
+def cmd_type(args): # Updated for 'g'
     global g
     if len(args)!=1: return "Usage: type <var>"
-    var=args[0].lower(); tp=None
+    var=args[0].lower()
+    tp=None
     if var in globals(): tp=type(globals().get(var)).__name__
     elif hasattr(g, var): tp=type(getattr(g, var)).__name__
     else: return f"Error: Var '{var}' not found."
     return f"Type of '{var}' is {tp}"
 
-def cmd_limbrk(args):
-    global g; count=0
-    logf=log_to_admin_output_threadsafe
-    targets=[]; target_vars = [k for k in g.__dict__ if k.endswith('_max')]
-    if not args or args[0].lower()=='all': targets=target_vars
+def cmd_limbrk(args): # Updated for 'g' and shortened vars
+    global g
+    count=0
+    logf=log_to_admin_output if th.current_thread() is th.main_thread() else log_to_admin_output_threadsafe
+    targets=[]
+    target_vars = [k for k in g.__dict__ if k.endswith('_max')] # Find all vars ending in _max
+
+    if not args or args[0].lower()=='all':
+        targets=target_vars
     else:
-        var=args[0].lower(); tgt=None
+        var=args[0].lower()
+        tgt=None
+        # Try matching common patterns
         if f"{var}_max" in target_vars: tgt=f"{var}_max"
-        elif var in target_vars: tgt = var
-        elif var.startswith("upg") and var[3:].isdigit() and f"upg{var[3:]}_max" in target_vars: tgt = f"upg{var[3:]}_max"
+        elif var in target_vars: tgt = var # Allow providing full name like 'upg1_max'
+        # Add more specific checks if needed (e.g., 'upg1' -> 'upg1_max')
+        elif var.startswith("upg") and var[3:].isdigit() and f"upg{var[3:]}_max" in target_vars:
+            tgt = f"upg{var[3:]}_max"
+
         if tgt: targets.append(tgt)
-        else: return f"Error: Cannot find '_max' var related to '{args[0]}'."
-    if not targets: return "No _max vars found/matched."
+        else: return f"Error: Cannot find a '_max' var related to '{args[0]}'."
+
+    if not targets: return "No _max vars found or matched."
     for t in targets:
         if hasattr(g,t):
             try:
                 current_val = getattr(g,t)
-                if isinstance(current_val,(int,float)): setattr(g,t,float('inf')); count+=1
-                else: logf(f"Warn: {t} not numeric ({type(current_val).__name__}).")
+                # Check if it's numeric before setting to inf
+                if isinstance(current_val,(int,float)):
+                    setattr(g,t,float('inf'))
+                    count+=1
+                    logf(f"Set {t} to Inf.")
+                else: logf(f"Warn: {t} is not numeric ({type(current_val).__name__}), skipped.")
             except Exception as e: logf(f"Error setting {t} to inf: {e}")
-        else: logf(f"Warn: Attribute {t} not on 'g'.")
-    if count>0: recalculate_derived_values(); return f"Set {count} max limits to inf. Recalculated."
+        else: logf(f"Warn: Attribute {t} not found on 'g' (should not happen).")
+
+
+    if count>0:
+        recalculate_derived_values() # Max levels affect calculations
+        return f"Set {count} max limits to inf. Recalculated."
     else: return "No limits changed."
 
-def cmd_settype(args):
-    global g;
+def cmd_settype(args): # Updated for 'g'
+    global g
     if len(args)!=2: return "Usage: settype <var> <type>"
-    var,t_str=args[0].lower(),args[1].lower(); tgt=None; is_g=False; cur=None
-    if var in globals(): tgt=globals(); is_g=True; cur=tgt.get(var)
-    elif hasattr(g, var): tgt=g; cur=getattr(g, var)
+    var,t_str=args[0].lower(),args[1].lower()
+    tgt=None
+    is_g=False
+    cur=None
+    if var in globals():
+        tgt=globals()
+        is_g=True
+        cur=tgt.get(var)
+    elif hasattr(g, var):
+        tgt=g
+        cur=getattr(g, var)
     else: return f"Error: Var '{var}' not found."
+
     new=None
     try:
-        val_str = str(cur)
-        if t_str=='int': new=int(float(val_str))
-        elif t_str=='float': new=float(val_str)
-        elif t_str=='str': new=str(val_str)
-        elif t_str=='bool': new=bool(cur)
-        elif t_str=='dict': new=ast.literal_eval(val_str); assert isinstance(new,dict)
-        elif t_str=='list': new=ast.literal_eval(val_str); assert isinstance(new,list)
+        current_val_str = str(cur) # Convert current value to string for conversion
+        if t_str=='int': new=int(float(current_val_str))
+        elif t_str=='float': new=float(current_val_str)
+        elif t_str=='str': new=str(current_val_str)
+        elif t_str=='bool': new=bool(cur) # Bool conversion uses truthiness
+        elif t_str=='dict': new=ast.literal_eval(current_val_str); assert isinstance(new,dict)
+        elif t_str=='list': new=ast.literal_eval(current_val_str); assert isinstance(new,list)
+        # Add 'set' if needed
         else: return f"Error: Unsupported target type '{t_str}'."
+
         if is_g: globals()[var]=new
         else: setattr(tgt, var, new)
+
+        # Check if recalc needed based on variable name (similar to setvalue)
         needs_recalc = True
-        vars_no_recalc_g = ['is_running']; vars_no_recalc_gs = ['last_save_time','admin_panel_active', 'playtime', 'active_chal']
+        vars_no_recalc_g = ['is_running']
+        vars_no_recalc_gs = ['last_save_time','admin_panel_active', 'playtime', 'active_chal']
         if is_g and var in vars_no_recalc_g: needs_recalc = False
         if not is_g and var in vars_no_recalc_gs: needs_recalc = False
-        res = f"Set type '{var}' to {t_str}. New: {new!r}."
-        if needs_recalc: recalculate_derived_values(); res += " Recalculated."
-        return res
-    except Exception as e: return f"Error converting '{var}' ({cur!r}) to {t_str}: {e}"
 
-def cmd_buy(args): # Updated for 'g', relics max level, challenges
-    global g, points # Use 'g'
+        res = f"Set type of '{var}' to {t_str}. New value: {new!r}."
+        if needs_recalc:
+             recalculate_derived_values()
+             res += " Recalculated."
+        return res
+
+    except Exception as e: return f"Error converting '{var}' (value: {cur!r}) to type {t_str}: {e}"
+
+def cmd_buy(args): # Updated for 'g', relics max level, challenges, pre-checks
+    global g, points, clicks # Use 'g', needs points/clicks for checks
     if len(args)<1 or len(args)>2: return "Usage: buy <id> [times=1]"
     id_str=args[0].lower()
     times=1
@@ -2400,40 +2537,46 @@ def cmd_buy(args): # Updated for 'g', relics max level, challenges
     bought=0
     for i in range(times):
         if not is_running: return f"Buy stopped after {bought} due to game closing."
-        # Pre-checks (can we even attempt the purchase due to challenge restrictions etc?)
+        # Pre-checks (can we even attempt the purchase due to restrictions, max levels, costs?)
         can_attempt = True
         reason="unknown"
 
-        # Challenge Restrictions
+        # Challenge Restrictions first
         if id_str == 'upg2' and g.active_chal == 'c1': can_attempt = False; reason = "in C1"
         elif id_str == 'upg3' and g.active_chal == 'c3': can_attempt = False; reason = "in C3"
         elif id_str == 'upg8' and g.active_chal == 'c7': can_attempt = False; reason = "in C7"
         elif id_str == 'purify' and g.active_chal == 'c6': can_attempt = False; reason = "in C6"
         elif id_str == 'ascend' and g.active_chal: can_attempt = False; reason = f"in Chal {g.active_chal}"
 
-        # Max Level / Resource Checks (Only if not blocked by challenge)
+        # Max Level / Resource / Unlock Checks (Only if not blocked by challenge)
         if can_attempt:
             if id_str in RELICS_DATA:
-                lvl=g.relic_lvls.get(id_str,0)
-                max_l=RELICS_DATA[id_str].get('max_level', RELIC_MAX_LEVEL)
+                lvl=g.relic_lvls.get(id_str,0); data=RELICS_DATA[id_str]
+                max_l=data.get('max_level', RELIC_MAX_LEVEL)
                 if max_l is not None and lvl>=max_l: can_attempt=False; reason="relic max"
-                else: # Check SD cost only if not maxed
-                    try: cost=round(RELICS_DATA[id_str]['cost_base']*(RELICS_DATA[id_str]['cost_scale']**lvl))
+                else:
+                    try: cost=round(data['cost_base']*(data['cost_scale']**lvl))
                     except OverflowError: cost = float('inf')
                     p23_reduction = 0.95 if g.pur_cnt >= 23 else 1.0
                     final_cost = round(cost * p23_reduction) if ma.isfinite(cost) else float('inf')
                     if g.sd < final_cost: can_attempt = False; reason="no SD"
             elif id_str=='purify':
-                # Simplified check, actual function handles details
-                 cost = g.pur_cost / g.p24_pur_cost_div
-                 current_pur_max = 20.0 if g.cr5_comp else (15.0 if g.upg5_comp else 10.0) # Calculate max
-                 if g.pur_cnt >= current_pur_max: can_attempt = False; reason = "max purify"
-                 elif points < cost: can_attempt = False; reason = "no points"
-                 # Add unlock checks if needed
+                 cost = g.pur_cost / g.p24_pur_cost_div; current_max = 20.0 if g.cr5_comp else (15.0 if g.upg5_comp else 10.0)
+                 if g.pur_cnt >= current_max: can_attempt = False; reason = "max purify"
                  elif g.pur_cnt >= 10 and not g.upg5_comp: can_attempt = False; reason = "req Upg5"
                  elif g.pur_cnt >= 15 and not g.cr5_comp: can_attempt = False; reason = "req C5"
-
-            # Add more pre-checks for affordability/max levels of upgrades if desired
+                 elif points < cost: can_attempt = False; reason = "no points"
+            elif id_str=='crystalline':
+                 cost = g.cryst_cost; current_max = 5.0 if g.pur_cnt >= 15 else 4.0
+                 if not g.cryst_unl: can_attempt = False; reason = "locked P10"
+                 elif g.cryst_cnt >= current_max: can_attempt = False; reason = "max cryst"
+                 elif g.cryst_cnt == 4 and g.pur_cnt < 15: can_attempt = False; reason = "req P15"
+                 elif points < cost: can_attempt = False; reason = "no points"
+            elif id_str=='ascend':
+                 cost = g.asc_cost
+                 if not g.asc_unl: can_attempt = False; reason = "locked C5"
+                 elif points < cost: can_attempt = False; reason = "no points"
+                 # Add 0 SD gain check? Could be slow. Function itself checks this.
             elif id_str=='upg1' and (g.upg1_lvl>=g.upg1_max or points < g.upg1_cost): can_attempt=False; reason="max/cost upg1"
             elif id_str=='upg2' and (g.upg2_lvl>=g.upg2_max or points < g.upg2_cost): can_attempt=False; reason="max/cost upg2"
             elif id_str=='upg3' and (g.upg3_lvl>=g.upg3_max or points < g.upg3_cost): can_attempt=False; reason="max/cost upg3"
@@ -2442,10 +2585,9 @@ def cmd_buy(args): # Updated for 'g', relics max level, challenges
             elif id_str=='upg6' and (g.upg6_comp or clicks < 100000 or not g.cr4_unl): can_attempt=False; reason="comp/cost/lock upg6"
             elif id_str=='upg7' and (g.upg7_lvl>=g.upg7_max or clicks < g.upg7_cost or not g.cr4_unl): can_attempt=False; reason="max/cost/lock upg7"
             elif id_str=='upg8' and (g.upg8_lvl>=g.upg8_max or clicks < g.upg8_cost or not g.cr4_unl): can_attempt=False; reason="max/cost/lock upg8"
-            # Add crystalline/ascend pre-checks if desired
 
         if not can_attempt:
-            # Only show message if trying to buy multiple times
+            # Only show message if trying to buy multiple times or first attempt failed
             if times > 1 or bought == 0:
                 res=f"Bought {id_str} {bought}x."
                 res+=f" Stopped (Pre-check: {reason})."
@@ -2497,13 +2639,11 @@ def cmd_buy(args): # Updated for 'g', relics max level, challenges
         elif id_str=='upg6' and g.upg6_comp: is_maxed=True # Completion flag
         elif id_str=='upg7' and g.upg7_lvl>=g.upg7_max: is_maxed=True
         elif id_str=='upg8' and g.upg8_lvl>=g.upg8_max: is_maxed=True
-        # --- Corrected Relic Check ---
         elif id_str in RELICS_DATA:
             lvl=g.relic_lvls.get(id_str,0)
             max_l=RELICS_DATA[id_str].get('max_level', RELIC_MAX_LEVEL)
             if max_l is not None and lvl>=max_l:
                 is_maxed=True
-        # --- End Corrected Relic Check ---
 
         if is_maxed and i < (times - 1): # Check if maxed before last iteration
             res=f"Bought {id_str} {bought}x."
@@ -2572,11 +2712,8 @@ def cmd_getchal(args):
     global g
     if len(args)!=1: return "Usage: getchal <id>"
     cid=args[0].lower()
-    # Check if challenge ID is valid *before* proceeding
     if cid not in CHALLENGES:
         return f"Error: Chal '{cid}' not found."
-
-    # Now proceed with getting challenge data and status
     chal=CHALLENGES[cid]
     lvl=g.chal_comps.get(cid,0)
     max_lvl=chal.get('max_completions')
@@ -2584,41 +2721,39 @@ def cmd_getchal(args):
     status="WIP"
     req_d = "Error"
     rew_d = "Error"
-
+    req_val = None # Define req_val before try block
     try:
-        # Need requirement value for check_func below
         req_val=chal['requirement_func'](g,lvl)
         req_d=chal['requirement_desc_func'](req_val)
     except Exception as e: req_d = f"ReqERR:{e}"
-
     try:
         rew_d=chal['reward_desc_func'](g, lvl + (0 if is_max else 1)) # Show next reward
     except Exception as e: rew_d = f"RewERR:{e}"
-
     if is_max: status="MAX"
     elif g.active_chal == cid:
          status="ACTIVE"
-         try:
-             # req_val should be defined from the try block above
-             if chal['check_func'](g,req_val): status="COMPLETABLE" # Can be completed now
-         except Exception as e: status = f"ACTIVE(ChkERR:{e})"
+         if req_val is not None: # Check if req_val was successfully calculated
+             try:
+                 if chal['check_func'](g,req_val): status="COMPLETABLE" # Can be completed now
+             except Exception as e: status = f"ACTIVE(ChkERR:{e})"
+         else: status = "ACTIVE(ReqERR)" # Indicate req calculation failed
     else:
-         # Check if completable even if not active (useful for debugging reqs)
-         try:
-             # req_val should be defined from the try block above
-             if chal['check_func'](g,req_val): status="COMPLETABLE(Not Active)"
-         except Exception: pass # Ignore error here, just means WIP
-
+         if req_val is not None: # Check if req_val was successfully calculated
+             try:
+                 if chal['check_func'](g,req_val): status="COMPLETABLE(Not Active)"
+             except Exception: pass # Ignore check error here, just means WIP
+         # If req_val is None, status remains "WIP"
     comp_s=f"({lvl}/{max_lvl})" if max_lvl is not None else f"({lvl})"
-    restrict = chal.get('restrictions_desc', 'N/A')
-    reset_lvl = chal.get('reset_level', 'ascension')
+    restrict = chal.get('restrictions_desc', 'N/A'); reset_lvl = chal.get('reset_level', 'ascension')
     return f"{cid.upper()}: {chal['desc_base']} {comp_s} [{status}]\nReq: {req_d}\nRew: {rew_d}\nRestrict: {restrict} | Reset: {reset_lvl}"
 
 def cmd_setchal(args):
     global g; logf=log_to_admin_output_threadsafe
     if len(args)!=2: return "Usage: setchal <id> <count>"
     try:
-        cid=args[0].lower(); count=int(args[1]); assert cid in CHALLENGES and count>=0
+        cid=args[0].lower()
+        if cid not in CHALLENGES: return f"Error: Chal ID '{cid}' not found."
+        count=int(args[1]); assert count>=0
         max_c = CHALLENGES[cid].get('max_completions')
         if max_c is not None and count > max_c: logf(f"Warn: Setting {count} > max {max_c}. Clamping."); count = max_c
         old_count = g.chal_comps.get(cid, 0); g.chal_comps[cid]=count
@@ -2655,7 +2790,7 @@ def cmd_forcechal(args):
         reset_for_challenge(cid); return f"Forced entry into challenge '{cid}'."
     elif action == 'exit':
         if not g.active_chal: return "Error: Not in a challenge."
-        exiting_chal = g.active_chal
+        exiting_chal = g.active_chal # Store ID before exiting
         exit_challenge(); return f"Forced exit from challenge '{exiting_chal}'."
     else: return "Error: Unknown action: 'enter' or 'exit'."
 
@@ -2683,8 +2818,11 @@ def cmd_help(args):
 
 def _wait_thread_func(s,tid):
     global active_admin_threads; logf=log_to_admin_output_threadsafe
-    logf(f"[{tid}] wait: Starting {s}s sleep..."); time.sleep(s); logf(f"[{tid}] wait: Finished.")
-    if tid in active_admin_threads: active_admin_threads.remove(tid)
+    logf(f"[{tid}] wait: Starting {s}s sleep...")
+    try: time.sleep(s); logf(f"[{tid}] wait: Finished.")
+    except Exception as e: logf(f"[{tid}] wait Error: {e}")
+    finally:
+        if tid in active_admin_threads: active_admin_threads.remove(tid)
 
 def cmd_wait(args):
     global active_admin_threads
@@ -2746,7 +2884,7 @@ def cmd_while(args):
 def cmd_setrelic(args):
     global g
     if len(args) != 2: return "Usage: setrelic <id> <lvl>"
-    rid, lvl_s = args[0].lower(), args[1] 
+    rid, lvl_s = args[0].lower(), args[1]
     if rid not in RELICS_DATA: return f"Error: Unknown relic '{rid}'."
     try: lvl = int(lvl_s); assert lvl >= 0
     except: return "Error: Lvl must be non-neg int."
@@ -2808,16 +2946,58 @@ def admin_execute_command(event=None):
     _execute_single_command(cmd_text, log_output=True)
 
 def log_to_admin_output(msg):
-    if th.current_thread() is not th.main_thread(): log_to_admin_output_threadsafe(msg); return
+    """Logs a message to the admin output widget (must run on main thread)."""
+    if th.current_thread() is not th.main_thread():
+        log_to_admin_output_threadsafe(msg)
+        return
+
     output_widget = admin_widgets.get('cmd_output')
     if output_widget and window and window.winfo_exists():
         try:
-            current_state = output_widget.cget("state")
-            output_widget.configure(state=tk.NORMAL)
-            output_widget.insert(tk.END, str(msg)+"\n")
-            output_widget.configure(state=current_state)
-            output_widget.see(tk.END)
-        except Exception as e: logging.warning(f"Failed log to admin output: {e}")
+            # --- Attempt to get the underlying tk.Text widget ---
+            # ttkbootstrap.scrolled.ScrolledText often stores the text widget
+            # in an attribute named 'text'. Check for its existence.
+            text_widget_to_configure = None
+            if hasattr(output_widget, 'text') and isinstance(output_widget.text, tk.Text):
+                text_widget_to_configure = output_widget.text
+                # logging.debug("Configuring internal 'text' widget.") # Optional debug log
+            elif isinstance(output_widget, tk.Text): # Maybe it IS the Text widget directly?
+                 text_widget_to_configure = output_widget
+                 # logging.debug("Configuring widget directly (assumed tk.Text).") # Optional
+            elif isinstance(output_widget, scrolledtext.ScrolledText): # Handle tkinter fallback
+                 # tkinter.scrolledtext *is* the frame, the text is internal, but configure might be forwarded?
+                 # Let's try configuring the wrapper first for the fallback case.
+                 # If this fails, one might need to dig deeper into ScrolledText internals, but
+                 # configure *should* work.
+                 text_widget_to_configure = output_widget
+                 # logging.debug("Configuring tkinter.scrolledtext directly.") # Optional
+
+            if text_widget_to_configure is None:
+                # Fallback if we couldn't find the text widget - configure the main widget
+                # This might be the source of the error if output_widget isn't a Text widget
+                # or doesn't properly delegate the state config.
+                text_widget_to_configure = output_widget
+                logging.warning("Could not reliably find internal Text widget, configuring main output_widget.")
+
+
+            # --- Configure the identified widget ---
+            # Use the 'state=' keyword argument, which is correct syntax.
+            text_widget_to_configure.configure(state=tk.NORMAL)
+            text_widget_to_configure.insert(tk.END, str(msg)+"\n")
+            text_widget_to_configure.configure(state=tk.DISABLED)
+
+            # Scroll the main ScrolledText widget (if different) or the text widget itself
+            # ScrolledText handles scrolling automatically usually when inserting at END
+            # but calling see() on the text widget is also common.
+            text_widget_to_configure.see(tk.END)
+
+        except tk.TclError as e:
+             # Log specific TclErrors if they still occur
+             logging.warning(f"TclError logging to admin output (widget: {type(output_widget)}, configuring: {type(text_widget_to_configure)}): {e}")
+             pass # Avoid crashing the application
+        except Exception as e:
+             logging.warning(f"Failed to log to admin output (widget: {type(output_widget)}): {e}")
+             pass # Avoid crashing the application
 
 def open_admin_panel():
     global admin_window, admin_widgets, g
