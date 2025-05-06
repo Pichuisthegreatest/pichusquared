@@ -13,3027 +13,2043 @@ import sys
 import os
 import logging
 import random
-import ast 
-import json 
-import base64 
-import time 
-from tkinter import messagebox 
+import ast
+import json
+import base64
+import time
+from tkinter import messagebox, PanedWindow
 
+# --- ttkScrolledText Fallback ---
 try:
     from ttkbootstrap.scrolled import ScrolledText as ttkScrolledText
 except ImportError:
-    ttkScrolledText = scrolledtext.ScrolledText 
+    class ttkScrolledText(tk.Frame):
+        """Basic ScrolledText fallback if ttkbootstrap.scrolled is unavailable."""
+        def __init__(self, master=None, **kw):
+            tk.Frame.__init__(self, master)
+            autohide = kw.pop('autohide', True)
+            scrollbar_style = kw.pop('bootstyle', None) # Pass bootstyle to scrollbar
+            text_font = kw.pop('font', None) # Handle font separately
+
+            self.text = tk.Text(self, wrap=kw.pop('wrap', tk.WORD), state=kw.pop('state', tk.NORMAL), font=text_font)
+            self.text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+            sb_style = f"{scrollbar_style}.Vertical.TScrollbar" if scrollbar_style else "Vertical.TScrollbar"
+            self.scrollbar = ttk.Scrollbar(self, orient=tk.VERTICAL, command=self.text.yview, style=sb_style)
+
+            self._autohide = autohide
+            self._scroll_visible = False
+
+            if not autohide:
+                self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+                self._scroll_visible = True
+
+            self.text.configure(yscrollcommand=self._scroll_manager)
+
+        def _scroll_manager(self, *args):
+            # Set scrollbar position
+            self.scrollbar.set(*args)
+            # Manage visibility if autohide is on
+            if self._autohide:
+                if float(args[0]) <= 0.0 and float(args[1]) >= 1.0:
+                    if self._scroll_visible:
+                        self.scrollbar.pack_forget()
+                        self._scroll_visible = False
+                else:
+                    if not self._scroll_visible:
+                        self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+                        self._scroll_visible = True
+
+        def insert(self, index, chars, *args): self.text.insert(index, chars, *args)
+        def delete(self, index1, index2=None): self.text.delete(index1, index2)
+        def get(self, index1, index2=None): return self.text.get(index1, index2)
+        def see(self, index): self.text.see(index)
+        def bind(self, sequence=None, func=None, add=None): self.text.bind(sequence, func, add)
+
+        def configure(self, **kw):
+            state = kw.pop('state', None)
+            if state is not None: self.text.configure(state=state)
+            try: tk.Frame.configure(self, **kw)
+            except tk.TclError:
+                 try: self.text.configure(**kw)
+                 except tk.TclError: logging.warning(f"Failed to configure fallback ScrolledText: {kw}")
+
+        @property
+        def state(self): return self.text['state']
+        @state.setter
+        def state(self, value): self.text.configure(state=value)
+        @property
+        def yscrollcommand(self): return self.text['yscrollcommand']
+        @yscrollcommand.setter
+        def yscrollcommand(self, command): self.text['yscrollcommand'] = command
 
 # --- Configuration ---
-SAVE_FILE = "save_encoded.dat" # New save file for major changes
+SAVE_FILE = "save_encoded.dat"
 LOG_FILE = "gamelog.txt"
-SAVE_VERSION = 31 # Incremented for fixes/updates
+SAVE_VERSION = 36 # Incremented for NF changes and full celestial reset
 UPDATE_INTERVAL_MS = 100
 TICK_INTERVAL_S = 0.1
 AUTOSAVE_INTERVAL_S = 30
-ADMINPANELACTIVATION = False #access to admin panel :3
-DEVELOPER_MODE = False #debug
-POINT_THRESHOLD_SP = 1e24
-RELIC_MAX_LEVEL = 10 
+DEVELOPER_MODE = False
+POINT_THRESHOLD_SP = 1e21
+RELIC_MAX_LEVEL = 10
+MAX_BUY_ITERATIONS = 100
+CELESTIALITY_REQ_ASC_LVL = 20
+CELESTIALITY_REQ_PTS = 1e37 # 10 Ud
+CELESTIALITY_REQ_CRYST = 5
+CELESTIALITY_REQ_PUR = 20
+NEBULA_FRAG_BASE_REQ_PTS = 1e37
+NEBULA_FRAG_BASE_REQ_SD = 1e12
+NEBULA_FRAG_BASE_REQ_ASC = 20
 
 # --- Logging Setup ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8'), 
+        logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8'),
         logging.StreamHandler(sys.stdout)
     ]
 )
+logging.info("--- Game Start ---")
 
 # --- Utility Functions ---
 ENDINGS = ["K","M","B","T","Qa","Qi","Sx","Sp","Oc","No","Dc","Ud","Dd","Td","Qad","Qid","Sxd","Spd","Ocd","Nod","Vg"]
 def format_number(num):
-    """Formats a number into a human-readable string with K, M, B, etc. suffixes."""
-    if not isinstance(num, (int, float)) or ma.isnan(num) or ma.isinf(num): return str(num)
+    if isinstance(num, bool): return str(num)
+    if not isinstance(num, (int, float)) or num is None or ma.isnan(num): return str(num)
+    if ma.isinf(num): return "Infinity" if num > 0 else "-Infinity"
     if abs(num) < 1000: return "{:.2f}".format(round(num, 2))
     if num == 0: return "0.00"
     sign = "-" if num < 0 else ""
     num_abs = abs(num)
+    if ma.isinf(num_abs): return f"{sign}Infinity" # Handle early inf case
     count = 0
     power = 1000.0
     num_div = num_abs
-    # Corrected loop logic for very large numbers
-    max_iterations = 100 # Safety break
+    max_iterations = 100
     iterations = 0
     while num_div >= power and count < len(ENDINGS) and iterations < max_iterations:
         try:
-            # Check for potential overflow before division
-            if num_div / power == float('inf'):
-                 break # Stop if division would result in infinity
-            num_div /= power
+            next_val = num_div / power
+            if ma.isinf(next_val): break
+            num_div = next_val
             count += 1
             iterations += 1
-        except OverflowError:
-            logging.warning(f"OverflowError during format_number loop for num: {num}")
-            break # Exit loop on overflow
-
-    if iterations >= max_iterations:
-        logging.warning(f"format_number reached max iterations for num: {num}")
-        return f"{sign}{num:.2e}" # Fallback to scientific notation
-
+        except OverflowError: break
+    if iterations >= max_iterations: return f"{sign}{num:.2e}"
     if count == 0: return "{}{:.2f}".format(sign, round(num_abs, 2))
     else:
-        # Ensure index is within bounds
         idx = min(count - 1, len(ENDINGS) - 1)
-        # Ensure num_div is finite before formatting
-        if ma.isinf(num_div) or ma.isnan(num_div):
-             return f"{sign}{num:.2e}" # Fallback if num_div is problematic
+        if ma.isinf(num_div) or ma.isnan(num_div): return f"{sign}{num:.2e}"
         return "{}{:.2f}{}".format(sign, round(num_div, 2), ENDINGS[idx])
 
-# Task 3: Obfuscation Function
 def obfuscate(text):
-  """Obfuscates text, replacing letters with '?' but keeping spaces/punctuation."""
-  return ''.join('?' if c.isalpha() else c for c in text)
+    return ''.join('?' if c.isalpha() else c for c in text)
 
-# --- Game State Object (Shortened Variables - Task 4) ---
+# --- Game State Object ---
 class GameState:
     def __init__(self):
-        # --- Point Upgrades ---
-        self.upg1_cost = 10.0
-        self.upg1_lvl = 0
-        self.upg1_max = 25.0 # Use float for Inf compatibility
-        self.upg2_cost = 100.0
-        self.upg2_lvl = 0
-        self.upg2_max = 10.0
-        self.upg3_cost = 10000.0
-        self.upg3_lvl = 0
-        self.upg3_max = 10.0
-        self.upg4_cost = 10000000.0
-        self.upg4_lvl = 0
-        self.upg4_max = 5.0
-        # --- Click Upgrades ---
-        self.upg5_comp = False # upgrade5_complete
-        self.upg6_comp = False # upgrade6_complete
-        self.upg7_cost = 1e6
-        self.upg7_lvl = 0
-        self.upg7_max = 50.0
-        self.upg8_cost = 1e9
-        self.upg8_lvl = 0
-        self.upg8_max = 100.0
-        # --- Calculated Modifiers ---
-        self.mult = 1.0 # multiplier
-        self.mult_str = 1.0 # multiplier_strength
-        self.pps_exp = 1.0 # pps_exponent
-        self.clk_pow = 1.0 # click_power
-        self.clk_crit_c = 0.0 # click_crit_chance
-        self.clk_crit_m = 2.0 # click_crit_multiplier
-        self.auto_cps = 0.0 # auto_clicks_per_sec
-        self.clk_pt_scale = 1.0 # click_point_scaling_bonus
-        # --- Purification State ---
-        self.pur_cnt = 0 # purify_times
-        self.pur_max = 10 # max_purify (can be dynamically updated)
-        self.pur_cost = 1000.0 # purify_cost
-        self.r1_boost = 1.0 # rank1_booster
-        self.r2_unl = False # rank2_unlocked
-        self.r3_unl = False # rank3_unlocked
-        self.r3_cost_m = 1.0 # rank3_cost_multiplier
-        self.r4_u2_boost = 1.0 # rank4_upg2_booster
-        self.r5_u3_boost = 0.0 # rank5_upg3_booster
-        self.r6_unl = False # rank6_unlocked
-        self.r6_boost = 1.0 # rank6_booster
-        # --- Crystalline State ---
-        self.cryst_unl = False # crystalline_unlocked
-        self.cryst_cnt = 0 # crystalline_times
-        self.cryst_max = 4 # max_crystalline (can be dynamically updated)
-        self.cryst_cost = 2.5e8 # crystalline_cost
-        self.cr1_boost = 1.0 # cry1_booster
-        self.cr1_u4_unl = False # cry1_upg4_unlocked
-        self.cr2_boost = 1.0 # cry2_booster
-        self.cr3_unl = False # cry3_unlocked
-        self.cr4_unl = False # cry4_unlocked
-        self.cr5_comp = False # crystalline_5_complete
-        # --- Ascension State (Task 2) ---
-        self.asc_unl = False # ascension_unlocked
-        self.asc_cnt = 0 # ascension_count
-        self.sd = 0.0 # stardust
-        self.asc_cost = 1e27 # ascension_cost
-        self.asc_lvl = 0 # NEW: Ascension Level
-        self.asc_xp = 0.0 # NEW: Ascension Experience
-        self.asc_first = False # NEW: has_ascended_once
-        # --- Relics (Task 1: Keep, remove Astrals) ---
-        self.relic_lvls = {} # relic_levels (Stores {relic_id: level})
-        # --- Synergy/Later Effects ---
-        self.cryst_comp_bonus = 1.0 # crystalline_completion_bonus
-        self.p11_pps_boost = 0.0 # p11_pps_boost_per_clickpower
-        self.p12_auto_u4 = False # p12_autobuy_upg4_unlocked
-        self.p14_u2_boost = 1.0 # p14_upg2_boost
-        self.p16_cost_reduc = 1.0 # p16_cost_reduction_factor
-        self.p17_u1_boost = 1.0 # p17_upg1_boost_to_rank4 (This is the boost factor itself)
-        self.p18_pass_clk = 0.0 # p18_passive_click_rate
-        self.p19_boost = 1.0 # p19_boost_multiplier (This is the boost factor itself)
-        self.p20_lim_brk = False # p20_limit_break_active
-        self.p24_pur_cost_div = 1.0 # p24_purify_cost_divisor
-        # --- Challenges (Task 5 & 6) ---
-        self.chal_comps = {} # challenge_completions
-        self.chal_sd_boost = 1.0 # challenge_stardust_boost (from c1 originally)
-        self.chal_perm_clk_boost = 1.0 # NEW: Permanent click boost from potential challenge
-        self.chal_upg_cost_scale_mult = 1.0 # NEW: Modifies upgrade cost scaling
-        self.active_chal = None # NEW: ID of the currently active challenge (e.g., 'c1')
-        # --- General State ---
-        self.playtime = 0.0 # total_playtime (Resets on challenge entry/ascension)
-        self.admin_panel_active = False
-        self.last_save_time = time.time()
-        # --- Scaling ---
-        self.pps_pt_scale_exp = 1.0 # pps_point_scaling_exponent
-        self.chal_eff_pps_exp_mod = 1.0 # NEW: Challenge effect modifier for PPS exponent
-        self.chal_eff_cost_exp_mod = 1.0 # NEW: Challenge effect modifier for cost exponent
+        # Point Upgrades
+        self.upg1_cst = 10.0; self.upg1_lvl = 0; self.upg1_max = 25.0
+        self.upg2_cst = 100.0; self.upg2_lvl = 0; self.upg2_max = 10.0
+        self.upg3_cst = 10000.0; self.upg3_lvl = 0; self.upg3_max = 10.0
+        self.upg4_cst = 10000000.0; self.upg4_lvl = 0; self.upg4_max = 5.0
+        # Click Upgrades
+        self.upg5_comp = False; self.upg6_comp = False
+        self.upg7_cst = 1e4; self.upg7_lvl = 0; self.upg7_max = 50.0
+        self.upg8_cst = 1e7; self.upg8_lvl = 0; self.upg8_max = 100.0
+        self.needs_recalc_from_click_xp = False
+        # Calculated Modifiers
+        self.mult = 1.0; self.mult_str = 1.0; self.pps_exp = 1.0
+        self.clk_pow = 1.0; self.clk_crit_c = 0.0; self.clk_crit_m = 2.0
+        self.auto_cps = 0.0; self.clk_pt_scale = 1.0
+        # Purification State
+        self.pur_cnt = 0; self.pur_max = 10; self.pur_cst = 1000.0
+        self.r1_bst = 1.0; self.r2_unl = False; self.r3_unl = False
+        self.r3_cst_m = 1.0; self.r4_u2_bst = 1.0; self.r5_u3_bst = 0.0
+        self.r6_unl = False; self.r6_bst = 1.0
+        # Crystalline State
+        self.cryst_unl = False; self.cryst_cnt = 0; self.cryst_max = 4
+        self.cryst_cst = 2.5e8; self.cr1_bst = 1.0; self.cr1_u4_unl = False
+        self.cr2_bst = 1.0; self.cr3_unl = False; self.cr4_unl = False
+        self.cr5_comp = False
+        # Ascension State
+        self.asc_unl = False; self.asc_cnt = 0; self.sd = 0.0
+        self.asc_cst = 1e27; self.asc_lvl = 0; self.asc_xp = 0.0
+        self.asc_first = False
+        # Celestiality State
+        self.celest_unl = False; self.celest_cnt = 0; self.nebula_fragments = 0.0
+        self.celest_cst = CELESTIALITY_REQ_PTS
+        # Relics
+        self.relic_lvls = {}
+        # Synergy/Later Effects
+        self.cryst_comp_bst = 1.0; self.p11_pps_bst = 0.0; self.p12_auto_u4 = False
+        self.p14_u2_bst = 1.0; self.p16_cst_reduc = 1.0; self.p17_u1_bst = 1.0
+        self.p18_pass_clk = 0.0; self.p19_bst = 1.0; self.p20_lim_brk = False
+        self.p24_pur_cst_div = 1.0
+        # Challenges
+        self.chal_comps = {}; self.chal_sd_bst = 1.0; self.chal_perm_clk_bst = 1.0
+        self.chal_upg_cst_scale_mult = 1.0; self.active_chal = None
+        # General State
+        self.playtime = 0.0; self.admin_panel_active = False; self.last_save_time = time.time()
+        # Scaling
+        self.pps_pt_scale_exp = 1.0
+        self.chal_eff_pps_exp_mod = 1.0
+        self.chal_eff_cst_exp_mod = 1.0
 
-    # Task 2: Ascension XP/Level Helpers
     def get_xp_for_level(self, level):
-        """Calculates XP needed for a given ascension level."""
-        if level < 0: return 0 # Avoid issues with negative levels
-        # Exponential scaling, adjust base/exponent as needed
-        try:
-             return 1000 * (1.8 ** level)
-        except OverflowError:
-             return float('inf') # Return infinity if calculation overflows
+        if level < 0: return 0
+        try: return 1000 * (1.8 ** level)
+        except OverflowError: return float('inf')
 
-    def check_ascension_level_up(self):
-        """Checks and processes ascension level ups."""
+    def check_ascension_level_up(self, from_click=False):
         leveled_up = False
-        # Use max(0, self.asc_lvl) to handle potential negative level state during load/admin
-        current_level = max(0, self.asc_lvl)
-        needed = self.get_xp_for_level(current_level + 1)
-        # Prevent infinite loops if needed is somehow zero or negative or inf
-        while 0 < needed < float('inf') and self.asc_xp >= needed:
-            self.asc_xp -= needed
-            self.asc_lvl += 1 # Increment level directly
-            current_level = self.asc_lvl # Update current level for next check
-            leveled_up = True
-            logging.info(f"Ascension Level Up! Reached Level {self.asc_lvl}")
-            needed = self.get_xp_for_level(current_level + 1) # Check for next level
+        current_lvl = int(max(0, self.asc_lvl))
+        needed = self.get_xp_for_level(current_lvl + 1)
+        if ma.isinf(self.asc_xp):
+            while 0 < needed < float('inf'):
+                self.asc_lvl += 1
+                current_lvl = int(self.asc_lvl)
+                leveled_up = True
+                logging.info(f"Ascension Level Up! Reached Level {self.asc_lvl} (Infinite XP)")
+                needed = self.get_xp_for_level(current_lvl + 1)
+        elif ma.isfinite(self.asc_xp):
+             while 0 < needed < float('inf') and self.asc_xp >= needed:
+                if ma.isinf(needed): break
+                if ma.isinf(self.asc_xp): break
+                self.asc_xp -= needed
+                self.asc_lvl += 1
+                current_lvl = int(self.asc_lvl)
+                leveled_up = True
+                logging.info(f"Ascension Level Up! Reached Level {self.asc_lvl}")
+                needed = self.get_xp_for_level(current_lvl + 1)
         if leveled_up:
-            recalculate_derived_values() # Recalculate boosts after level up
+            if from_click:
+                self.needs_recalc_from_click_xp = True
+            else:
+                recalculate_derived_values()
+            self.check_celestiality_unlock()
+        return leveled_up
 
-    def get_asc_pt_boost(self): # get_ascension_point_boost
-        """Calculates point boost from ascension level."""
-        # Example: +10% multiplicative per level
-        # Use max(0, self.asc_lvl) to avoid issues if level is negative
+    def get_asc_pt_boost(self):
+        lvl = int(max(0, self.asc_lvl))
+        try: return (1.10 ** lvl)
+        except OverflowError: return float('inf')
+
+    def get_asc_clk_boost(self):
+        lvl = int(max(0, self.asc_lvl))
+        try: return (1.05 ** lvl)
+        except OverflowError: return float('inf')
+
+    def get_chal_relic_eff_boost(self, rid): return 1.0 # Chal 7 removed
+
+    def check_celestiality_unlock(self):
+        if not self.celest_unl and \
+           int(self.asc_lvl) >= CELESTIALITY_REQ_ASC_LVL and \
+           self.cr5_comp and \
+           self.pur_cnt >= CELESTIALITY_REQ_PUR:
+            self.celest_unl = True
+            logging.info("Celestiality Unlocked!")
+
+    def get_nf_point_boost(self):
+        if self.nebula_fragments <= 0: return 1.0
         try:
-             base_boost = (1.10 ** max(0, self.asc_lvl))
-        except OverflowError:
-             base_boost = float('inf')
-        return base_boost * self.get_chal_asc_pt_boost() # Factor in challenge rewards
+            boost = (ma.log10(self.nebula_fragments + 1) + 1) ** 2 # Example formula
+            return max(1.0, boost)
+        except (ValueError, OverflowError): return float('inf')
 
-    def get_asc_clk_boost(self): # get_ascension_click_boost
-        """Calculates click boost from ascension level."""
-        # Example: +5% multiplicative per level
+    def get_nf_stardust_boost(self):
+        if self.nebula_fragments <= 0: return 1.0
         try:
-            base_boost = (1.05 ** max(0, self.asc_lvl))
-        except OverflowError:
-            base_boost = float('inf')
-        return base_boost * self.get_chal_asc_clk_boost() # Factor in challenge rewards
+            boost = (ma.log10(self.nebula_fragments + 1) * 2 + 1) # Example formula
+            return max(1.0, boost)
+        except (ValueError, OverflowError): return float('inf')
 
-    # --- Challenge Reward Helpers (Examples - Expand as needed) ---
-    def get_chal_asc_pt_boost(self):
-        """Calculates challenge-based boost to Ascension Point Boost."""
-        boost = 1.0
-        # Example: Reward from C6
-        c6_completions = self.chal_comps.get('c6', 0)
-        if c6_completions > 0:
-            # Example: +1% effectiveness per completion (multiplicative)
-            boost *= (1.0 + 0.01 * c6_completions)
-        return boost
-
-    def get_chal_asc_clk_boost(self):
-        """Calculates challenge-based boost to Ascension Click Boost."""
-        boost = 1.0
-        # Example: Could add a reward from another challenge here
-        # cX_completions = self.chal_comps.get('cX', 0)
-        # if cX_completions > 0:
-        #     boost *= (1.0 + YYY * cX_completions)
-        return boost
-
-    def get_chal_relic_eff_boost(self, relic_id):
-        """Calculates challenge-based boost to specific relic effectiveness."""
-        boost = 1.0
-        # Example: Reward from C7 affecting pt/clk relics
-        c7_completions = self.chal_comps.get('c7', 0)
-        if c7_completions > 0 and relic_id in ['relic_pt_mult', 'relic_clk_mult']:
-             # Example: Make the base multiplier X% more effective (multiplicative)
-             boost *= (1 + 0.002 * c7_completions) # Increases effectiveness by 0.2% per level
-        return boost
-
+    def get_nf_relic_boost(self):
+        if self.nebula_fragments <= 0: return 1.0
+        try:
+            boost = (ma.log10(self.nebula_fragments + 1) * 0.5 + 1) # Example formula
+            return max(1.0, boost)
+        except (ValueError, OverflowError): return float('inf')
 
 # --- Global Variables ---
-g = GameState() # Use shortened 'g' for game_state
-points = 0.0
-clicks = 0.0
-pps = 0.0 # point_per_second
-is_running = True
-autobuy_thread = None
+g = GameState(); pts = 0.0; clks = 0.0; pps = 0.0
+is_running = True; autobuy_thd = None
 
-# --- Relic Definitions (Task 1: Max Level Applied) ---
+# --- Relic Definitions ---
 RELICS_DATA = {
-    # ID: { name, desc, cost_base, cost_scale, max_level, effect_func(level), Optional: effect_desc_func(level) }
-    'relic_pt_mult': { 'name': "Star Prism", 'desc': "+5% Points per level (mult)", 'cost_base': 5, 'cost_scale': 1.8, 'max_level': RELIC_MAX_LEVEL, 'effect': lambda lvl: 1.05 ** lvl },
-    'relic_clk_mult': { 'name': "Kinetic Shard", 'desc': "+8% Effective Clicks per level (mult)", 'cost_base': 5, 'cost_scale': 1.8, 'max_level': RELIC_MAX_LEVEL, 'effect': lambda lvl: 1.08 ** lvl },
-    'relic_u1_str': { 'name': "Amplifying Lens", 'desc': "Upg1 base multiplier gain +0.02 per level", 'cost_base': 10, 'cost_scale': 2.0, 'max_level': RELIC_MAX_LEVEL, 'effect': lambda lvl: 0.02 * lvl }, # Capped
-    'relic_p6_exp': { 'name': "Echoing Chamber", 'desc': "P6 Purify Boost ^(1 + 0.01*Lvl)", 'cost_base': 25, 'cost_scale': 2.5, 'max_level': RELIC_MAX_LEVEL, 'effect': lambda lvl: 1.0 + 0.01 * lvl }, # Capped
-    'relic_sd_gain': { 'name': "Cosmic Magnet", 'desc': "+2% Stardust gain per level (mult)", 'cost_base': 50, 'cost_scale': 3.0, 'max_level': RELIC_MAX_LEVEL, 'effect': lambda lvl: 1.02 ** lvl },
-    # Add more relics if desired
-    'relic_u3_eff': { 'name': "Exponent Crystal", 'desc': "Upg3 Exponent Gain +1% per level (mult)", 'cost_base': 100, 'cost_scale': 2.2, 'max_level': RELIC_MAX_LEVEL, 'effect': lambda lvl: 1.01 ** lvl },
-    'relic_crit_c': { 'name': "Focusing Matrix", 'desc': "+0.5% Crit Chance (additive)", 'cost_base': 30, 'cost_scale': 1.9, 'max_level': RELIC_MAX_LEVEL, 'effect': lambda lvl: 0.005 * lvl },
+    'relic_pt_mult': { 'name': "Star Prism", 'desc': "+100% Points per level (mult)", 'cost_base': 1, 'cost_scale': 1.2, 'max_level': RELIC_MAX_LEVEL, 'effect': lambda lvl: 2.0 ** lvl },
+    'relic_clk_mult': { 'name': "Kinetic Shard", 'desc': "+100% Effective Clicks per level (mult)", 'cost_base': 1, 'cost_scale': 1.2, 'max_level': RELIC_MAX_LEVEL, 'effect': lambda lvl: 2.0 ** lvl },
+    'relic_u1_str': { 'name': "Amplifying Lens", 'desc': "Upg1 base multiplier gain +0.02 per level", 'cost_base': 8, 'cost_scale': 1.8, 'max_level': RELIC_MAX_LEVEL, 'effect': lambda lvl: 0.02 * lvl },
+    'relic_p6_exp': { 'name': "Echoing Chamber", 'desc': "P6 Purify Boost ^(1 + 0.01*Lvl)", 'cost_base': 15, 'cost_scale': 2.0, 'max_level': RELIC_MAX_LEVEL, 'effect': lambda lvl: 1.0 + 0.01 * lvl },
+    'relic_sd_gain': { 'name': "Cosmic Magnet", 'desc': "+2% Stardust gain per level (mult)", 'cost_base': 20, 'cost_scale': 2.2, 'max_level': RELIC_MAX_LEVEL, 'effect': lambda lvl: 1.02 ** lvl },
+    'relic_u3_eff': { 'name': "Exponent Crystal", 'desc': "Upg3 Exponent Gain +1% per level (mult)", 'cost_base': 50, 'cost_scale': 1.9, 'max_level': RELIC_MAX_LEVEL, 'effect': lambda lvl: 1.01 ** lvl },
+    'relic_crit_c': { 'name': "Focusing Matrix", 'desc': "+0.5% Crit Chance (additive)", 'cost_base': 10, 'cost_scale': 1.5, 'max_level': RELIC_MAX_LEVEL, 'effect': lambda lvl: 0.005 * lvl },
 }
 
-# Helper to get relic effect safely
-def get_relic_effect(relic_id, default=1.0):
-    """Gets the calculated effect of a relic at its current level, including challenge boosts."""
-    global g
-    lvl = g.relic_lvls.get(relic_id, 0)
-    data = RELICS_DATA.get(relic_id)
+def get_relic_effect(rid, default=1.0):
+    lvl = g.relic_lvls.get(rid, 0); data = RELICS_DATA.get(rid)
     if data and 'effect' in data:
         try:
-            # Apply challenge boosts to relic effectiveness
-            eff_boost = g.get_chal_relic_eff_boost(relic_id)
-            base_effect = data['effect'](lvl)
+            base_eff = data['effect'](lvl)
+            if ma.isinf(base_eff) or base_eff == default: return base_eff
+            nf_boost = g.get_nf_relic_boost()
+            if ma.isinf(nf_boost): return float('inf')
 
-            # How the boost applies depends on the effect type
-            if relic_id == 'relic_u1_str': # Additive base effect
-                return base_effect * eff_boost # Assume boost multiplies the additive gain
-            elif relic_id == 'relic_crit_c': # Additive base effect
-                # Does C7 boost additive crit chance? Assume yes for now.
-                return base_effect * eff_boost
-            elif eff_boost != 1.0: # Multiplicative base effect, apply boost carefully
-                # Boost the *percentage* increase: (Base - 1) * Boost + 1
-                # Example: Base = 1.05, Boost = 1.1 => (1.05-1)*1.1 + 1 = 0.05*1.1 + 1 = 0.055 + 1 = 1.055
-                # Ensure base_effect is a number
-                if isinstance(base_effect, (int, float)):
-                    return (base_effect - 1.0) * eff_boost + 1.0
-                else:
-                    logging.warning(f"Non-numeric base_effect {base_effect} for relic {relic_id}")
-                    return default # Fallback
-            else: # No boost, just return base effect
-                return base_effect
-        except Exception as e:
-             logging.error(f"Error calculating effect for relic {relic_id}: {e}")
-             return default # Fallback on error
+            if rid in ['relic_u1_str', 'relic_crit_c']:
+                 effective_eff = base_eff * nf_boost
+            elif isinstance(base_eff, (int, float)) and base_eff > 0:
+                 effective_eff = ((base_eff - 1.0) * nf_boost) + 1.0
+            else: effective_eff = base_eff # No boost otherwise
+
+            return effective_eff
+        except OverflowError: return float('inf')
+        except Exception as e: logging.error(f"Relic effect error {rid}: {e}"); return default
     return default
 
+# --- Prestige Descriptions / Challenges / Help ---
+PURIFY_DESCRIPTIONS = ["x3 point gain. Afterwards, x2 point gain.", "+1 max level to Upgs 1 & 2.", "Upg 1-3 cost x0.95 (mult).", "Upg 2 Strength base multiplier x3.", "Upg 3 base exponent gain +0.01/lvl.", "Gain (1+Purify Times)^2 PPS multiplier.", "No boost.", "No boost. Try again?", "No boost. Next unlocks something!", "Unlock Crystalline layer.", "Click Power adds +0.1% base PPS per point.", "Autobuy Upgrade 4.", "Each Crystalline +5% points (mult).", "Upg 2 base factor +50%.", "Unlock buying Crystalline V.", "Reduce upgrade cost scaling per Crystalline.", "Upg 1 levels slightly boost Rank 4 effect.", "Passive Clicks (1% of Click Power/sec).", "Boost previous Purifications power x1.25.", "LIMIT BREAK: +10 Max Levels Upgs 1 & 2.", "P21: Faster Crystalline Autobuyer (if unlocked)", "P22: Stardust gain x1.1", "P23: Reduce Relic costs by 5%", "Purify cost / sqrt(Purify Times)."]
+CRYSTALLINE_DESCRIPTIONS = ["x3 point gain. Unlock Upgrade 4.", "Point gain ^1.5.", "Autobuy Upgrades 1-3.", "Unlock Clicking & Click Upgs. Base Click Power x100.", "Unlock P16-20+. Activate Playtime boost (needs Upg6). Unlock Ascension."]
+CELESTIALITY_DESCRIPTIONS = ["Perform a full reset (keeps Celestiality progress). Gain Nebula Fragments based on prior progress, boosting Points, Stardust, and Relics."]
 
-# --- Prestige Descriptions / Challenges ---
-PURIFY_DESCRIPTIONS = [
-    "x3 point gain. Afterwards, x2 point gain.", # P1 (Index 0)
-    "+1 max level to Upgs 1 & 2.", # P2 (Index 1)
-    "Upg 1-3 cost x0.95 (mult).", # P3 (Index 2)
-    "Upg 2 Strength base multiplier x3.", # P4 (Index 3)
-    "Upg 3 base exponent gain +0.01/lvl.", # P5 (Index 4)
-    "Gain (1+Purify Times)^2 PPS multiplier.", # P6 (Index 5)
-    "No boost.", "No boost. Try again?", "No boost. Next unlocks something!", # P7-9 (Index 6-8)
-    "Unlock Crystalline layer.", # P10 (Index 9)
-    "Click Power adds +0.1% base PPS per point.", # P11 (Index 10)
-    "Autobuy Upgrade 4.", # P12 (Index 11)
-    "Each Crystalline +5% points (mult).", # P13 (Index 12)
-    "Upg 2 base factor +50%.", # P14 (Index 13) (Description simplified)
-    "Unlock buying Crystalline V.", # P15 (Index 14)
-    "Reduce upgrade cost scaling per Crystalline.", # P16 (Index 15)
-    "Upg 1 levels slightly boost Rank 4 effect.", # P17 (Index 16)
-    "Passive Clicks (1% of Click Power/sec).", # P18 (Index 17)
-    "Boost previous Purifications power x1.25.", # P19 (Index 18)
-    "LIMIT BREAK: +10 Max Levels Upgs 1 & 2.", # P20 (Index 19)
-    "P21: Faster Crystalline Autobuyer (if unlocked)", # P21 (Index 20) - Example new
-    "P22: Stardust gain x1.1", # P22 (Index 21) - Example new
-    "P23: Reduce Relic costs by 5%", # P23 (Index 22) - Example new
-    "Purify cost / sqrt(Purify Times).", # P24 (Index 23)
-]
-CRYSTALLINE_DESCRIPTIONS = [
-    "x3 point gain. Unlock Upgrade 4.", # C1 (Index 0)
-    "Point gain ^1.5.", # C2 (Index 1)
-    "Autobuy Upgrades 1-3.", # C3 (Index 2)
-    "Unlock Clicking & Click Upgs.", # C4 (Index 3)
-    "Unlock P16-20+. Activate Playtime boost (needs Upg6). Unlock Ascension.", # C5 (Index 4)
-]
+CHALLENGES = { # Renamed and strengthened challenges
+    'c1': { 'db': "No Upg2: Reach High Points", 'mc': 100, 'rf': lambda g, c: 1e9*(2000**(c+1)), 'rd': lambda r: f"Req: {format_number(r)} Pts", 'cf': lambda g, r: (g.active_chal=='c1' and pts>=r and g.upg2_lvl==0), 'rwd': lambda g, c: f"R: +{(20.0 + c*10.0):.1f}% SD Gain (Mult)", 'arf': lambda g: setattr(g,'chal_sd_bst',g.chal_sd_bst*(1.20 + g.chal_comps.get('c1',0)*0.10)), 'restr': "No Upg2.", 'ef': None, 'rl': 'cryst'},
+    'c2': { 'db': "No Upg3: Reach Crystalline Count", 'mc': 100, 'rf': lambda g, c: c+1, 'rd': lambda r: f"Req: Cryst {r}", 'cf': lambda g, r: (g.active_chal=='c2' and g.cryst_cnt>=r and g.upg3_lvl==0), 'rwd': lambda g, c: f"R: Upg3 Cost x{0.98**(c+1):.4f}", 'arf': lambda g: setattr(g,'r3_cst_m',g.r3_cst_m * 0.98), 'restr': "No Upg3.", 'ef': None, 'rl': 'asc'},
+    'c3': { 'db': "Expensive Growth: Reach Points", 'mc': 50, 'rf': lambda g, c: 1e15*(75**(c+1)), 'rd': lambda r: f"Req: {format_number(r)} Pts", 'cf': lambda g, r: (g.active_chal=='c3' and pts>=r), 'rwd': lambda g, c: f"R: Upg1-4 Scale x{(1.0/(1.0+0.002*(c+1))):.4f}", 'arf': lambda g: setattr(g,'chal_upg_cst_scale_mult', 1.0 / (1.0 + 0.002 * (g.chal_comps.get('c3', 0) + 1))), 'restr': "Upg1-4 cost scale +25%.", 'ef': lambda g: setattr(g,'chal_eff_cst_exp_mod',1.25), 'rl': 'cryst'},
+}
 
-# --- Task 5 & 6: New Challenge Definitions ---
-CHALLENGES = {
-    # --- Existing Challenges (Modified) ---
-    'c1': {
-        'desc_base': "No Upg2: Reach High Points",
-        'max_completions': 100,
-        'requirement_func': lambda g, comp: 1e9 * (1000**(comp + 1)), # Much harder scaling
-        'requirement_desc_func': lambda req: f"Req: {format_number(req)} Points",
-        'check_func': lambda g, req: ( g.active_chal == 'c1' and not ma.isinf(points) and points >= req and g.upg2_lvl == 0 ),
-        'reward_desc_func': lambda g, comp: f"Reward: +{1 + comp * 0.5:.1f}% Stardust Gain (Mult)", # Slower reward scaling
-        # Reward is based on *current* completions AFTER this one would be finished
-        # Ensure chal_comps lookup is safe
-        'apply_reward_func': lambda g: setattr(g, 'chal_sd_boost', g.chal_sd_boost * (1.01 + g.chal_comps.get('c1', 0) * 0.005)),
-        'restrictions_desc': "Cannot buy Upgrade 2.", # For UI
-        'effect_func': None, # No active effect needed, just restriction check
-        'reset_level': 'crystalline', # Reset needed to enter
-    },
-    'c2': {
-        'desc_base': "Fast Clicks: Reach Clicks in 2 Mins",
-        'max_completions': 100,
-        'requirement_func': lambda g, comp: 1e7 * (15**(comp + 1)), # Harder click req
-        'requirement_desc_func': lambda req: f"Req: {format_number(req)} Clicks",
-        'check_func': lambda g, req: ( g.active_chal == 'c2' and clicks >= req and g.playtime <= 120 ), # Shorter time
-        'reward_desc_func': lambda g, comp: f"Reward: +{0.2 + comp * 0.02:.2f}% Perm. Click Power (Mult)", # Less % gain per level (Corrected reward scaling)
-        'apply_reward_func': lambda g: setattr(g, 'chal_perm_clk_boost', g.chal_perm_clk_boost * (1.002 + g.chal_comps.get('c2', 0) * 0.0002)), # Very slow scaling boost
-        'restrictions_desc': "Complete within 120 seconds of starting challenge.",
-        'effect_func': None,
-        'reset_level': 'crystalline',
-    },
-    'c3': {
-        'desc_base': "No Upg3: Reach Crystalline Count",
-        'max_completions': 100,
-        'requirement_func': lambda g, comp: comp + 1, # Keep simple req (req C1, C2, C3...)
-        'requirement_desc_func': lambda req: f"Req: Reach Crystalline {req}",
-        'check_func': lambda g, req: ( g.active_chal == 'c3' and g.cryst_cnt >= req and g.upg3_lvl == 0 ), # Cryst count within challenge
-        'reward_desc_func': lambda g, comp: f"Reward: Upg3 Cost x{0.99** (comp+1):.3f}", # Much smaller cost reduction (Show effect for *next* completion)
-        'apply_reward_func': lambda g: setattr(g, 'r3_cost_m', g.r3_cost_m * 0.99), # Apply 1% reduction each time
-        'restrictions_desc': "Cannot buy Upgrade 3.",
-        'effect_func': None,
-        'reset_level': 'ascension', # Need full reset to attempt multiple crystallines
-    },
-    # --- New Challenges (Examples) ---
-    'c4': {
-        'desc_base': "Power Limit: Reach Points with PPS^0.9",
-        'max_completions': 50,
-        'requirement_func': lambda g, comp: 1e20 * (100**(comp + 1)), # High point req due to nerf
-        'requirement_desc_func': lambda req: f"Req: {format_number(req)} Points",
-        'check_func': lambda g, req: ( g.active_chal == 'c4' and points >= req ),
-        'reward_desc_func': lambda g, comp: f"Reward: Improve PPS Point Scaling Exponent Floor by {0.001 * (comp+1):.3f}", # Affects min exponent in recalc
-        # This reward needs to be applied within recalculate_derived_values based on chal_comps['c4']
-        'apply_reward_func': lambda g: None, # No direct state change, effect is passive based on completions
-        'restrictions_desc': "All Point Gain is raised to the power of 0.9.",
-        'effect_func': lambda g: setattr(g, 'chal_eff_pps_exp_mod', 0.9), # Apply effect
-        'reset_level': 'crystalline',
-    },
-    'c5': {
-        'desc_base': "Expensive Growth: Reach Points with Faster Cost Scaling",
-        'max_completions': 50,
-        'requirement_func': lambda g, comp: 1e15 * (50**(comp + 1)),
-        'requirement_desc_func': lambda req: f"Req: {format_number(req)} Points",
-        'check_func': lambda g, req: ( g.active_chal == 'c5' and points >= req ),
-        'reward_desc_func': lambda g, comp: f"Reward: Upg 1-4 Base Cost Scaling reduced by {(comp+1)*0.1:.1f}% (Mult)", # Reduce base scaling factor slightly
-        # This applies multiplicatively: Cost *= (BaseFactor * ChalEffect * ChalReward)**Level
-        'apply_reward_func': lambda g: setattr(g, 'chal_upg_cost_scale_mult', 1.0 / (1.0 + 0.001 * (g.chal_comps.get('c5',0)+1))), # Reduces the scaling factor towards 1
-        'restrictions_desc': "Upg 1-4 base cost scaling factor increased by 25%.",
-        'effect_func': lambda g: setattr(g, 'chal_eff_cost_exp_mod', 1.25), # Apply effect
-        'reset_level': 'crystalline',
-    },
-    'c6': {
-        'desc_base': "No Purify: Reach Crystalline",
-        'max_completions': 10, # Limited completions make sense here
-        'requirement_func': lambda g, comp: 1, # Always req Crystalline 1
-        'requirement_desc_func': lambda req: f"Req: Reach Crystalline 1",
-        'check_func': lambda g, req: ( g.active_chal == 'c6' and g.cryst_cnt >= req and g.pur_cnt == 0 ),
-        'reward_desc_func': lambda g, comp: f"Reward: +{(comp+1)}% effectiveness to Ascension Level Point Boost", # Additive % boost
-        'apply_reward_func': lambda g: None, # Passive effect applied in get_chal_asc_pt_boost based on completions
-        'restrictions_desc': "Cannot Purify.",
-        'effect_func': None, # Handled by checking pur_cnt in purify() potentially, or just UI disable
-        'reset_level': 'ascension', # Needs full reset
-    },
-     'c7': {
-        'desc_base': "Manual Only: Reach High Clicks",
-        'max_completions': 25,
-        'requirement_func': lambda g, comp: 1e8 * (20**(comp + 1)),
-        'requirement_desc_func': lambda req: f"Req: {format_number(req)} Clicks", # Requirement is total clicks, but source is restricted
-        'check_func': lambda g, req: ( g.active_chal == 'c7' and clicks >= req and g.upg8_lvl == 0 and g.p18_pass_clk == 0), # Check no auto-clickers active
-        'reward_desc_func': lambda g, comp: f"Reward: +{0.2 + comp * 0.02:.2f}% Effectiveness for Point/Click Relics", # Reward based on *next* completion
-        'apply_reward_func': lambda g: None, # Passive effect applied in get_relic_effect via get_chal_relic_eff_boost
-        'restrictions_desc': "Cannot buy Upg8. P18 disabled.",
-        # Effect func ensures P18 is off during the challenge recalc checks
-        'effect_func': lambda g: setattr(g, 'p18_pass_clk', 0) if g.active_chal == 'c7' else None,
-        'reset_level': 'crystalline',
-    },
+HELP_CONTENT = { # Edit the triple-quoted strings below to change help text
+    'points': """**Points**
+Points are the primary currency in the early game. You generate Points Per Second (PPS) based on your upgrades. You can also spend Points on upgrades to increase your PPS or unlock new mechanics.""",
+    'purify': """**Purification**
+Purification is the first prestige layer, unlocked by reaching the point requirement.
+- **Reset:** Resets Points, Point Upgrades (1-4), and Playtime (unless in a challenge). Keeps Crystalline progress, Ascension progress, Relics, etc.
+- **Reward:** Each Purification grants a unique, permanent bonus listed on the Purify button. These boosts stack and some synergize with later layers or get boosted themselves. Reaching certain Purify milestones unlocks new game layers like Crystalline.
+- **Cost:** Increases with each Purification.""",
+    'crystalline': """**Crystalline**
+Crystalline is the second prestige layer, unlocked at Purification 10.
+- **Reset:** Resets everything Purify resets, PLUS Purification progress and Purify bonuses. Keeps Ascension progress, Relics, Challenges, etc.
+- **Reward:** Each Crystalline level grants a powerful permanent bonus, such as point multipliers, unlocking Upgrade 4, unlocking Autobuyers, unlocking Clicking, or unlocking Ascension.
+- **Cost:** Increases significantly with each Crystalline level.""",
+    'clicking': """**Clicking**
+Unlocked at Crystalline 4. Allows manual clicking and introduces Click upgrades.
+- **Clicks:** A new currency generated by clicking the 'Click!' button or by the Auto Clicker (Upg 8).
+- **Click Power:** Determines how many Clicks you get per manual click. Affected by base power, relics, ascension, and point scaling.
+- **Click Upgrades:** Spend Clicks to improve clicking (Crit Chance/Multiplier - Upg7) or automate clicks (Auto Clicker - Upg8). Upg5 and Upg6 unlock more Purify levels and enable Crystalline 5 effects.
+- **Interaction:** Some Purify bonuses use Click Power to boost PPS.""",
+    'ascension': """**Ascension**
+The third prestige layer, unlocked at Crystalline 5. This is a major reset.
+- **Reset:** Resets everything Crystalline resets, PLUS Crystalline progress/bonuses, Clicking progress/upgrades, and Clicks. Keeps Stardust, Ascension Level/XP, Relics, and Challenge completions.
+- **Reward:** Gain Stardust (SD) based on Points and Crystalline count at the time of Ascending. Stardust is used to buy powerful Relics. Gain Ascension XP based on Points and SD gain, which increases your Ascension Level.
+- **Ascension Level:** Each level provides permanent passive boosts to Point Gain and Click Power.
+- **Cost:** Requires a high amount of Points.""",
+    'relics': """**Relics**
+Unlocked after your first Ascension. Purchased with Stardust (SD).
+- **Stardust:** Earned by Ascending. Gain is boosted by specific challenges, relics, and the amount of progress made before Ascending. Can be boosted further by Celestiality.
+- **Purchase:** Relics provide powerful, permanent passive bonuses that affect various game mechanics (Points, Clicks, Upgrade effects, etc.). Their effectiveness can be further boosted by Celestiality.
+- **Levels:** Each Relic can be leveled up multiple times, increasing its effect but also its Stardust cost. Costs scale exponentially. Some Purify bonuses can reduce Relic costs.""",
+    'challenges': """**Challenges**
+Unlocked after your first Ascension. Offer unique rewards for completing specific goals under restrictions.
+- **Entry:** Entering a challenge forces a reset specific to that challenge (usually Crystalline or Ascension level) and applies its restrictions. You cannot Purify, Crystalline, Ascend, or enter another challenge while in one.
+- **Completion:** Meet the goal shown (e.g., reach X points, Y clicks) while respecting the restrictions.
+- **Reward:** Completing a challenge grants a permanent, stacking bonus. Each challenge can be completed multiple times (up to its cap) for increasingly powerful rewards.
+- **Exit:** You can exit a challenge early without reward via the 'Exit Challenge' button, which performs an Ascension reset.""",
+    'celestiality': """**Celestiality** (Very Late Game)
+The fourth prestige layer, unlocked after reaching Ascension Level 20, Crystalline 5, and Purify 20.
+- **Reset:** Performs a **FULL** reset of previous layers, including Points, Clicks, Purify, Crystalline, Ascension (Level/XP), and Stardust. Relics and Challenges are also reset. Only Celestiality progress (Nebula Fragments, Celestiality Count) is kept.
+- **Reward:** Gain **Nebula Fragments** (NF) based on your Points, Stardust, and Ascension Level at the time of reset. Nebula Fragments provide powerful, scaling bonuses:
+    - Significantly boosts Point gain.
+    - Significantly boosts Stardust gain on Ascension.
+    - Increases the effectiveness of all Relics.
+- **Cost:** Requires an immense amount of Points (starting at 10 Undecillion) and increases dramatically with each Celestiality.""",
 }
 
 # --- Core Calculation Logic ---
 def calculate_click_point_bonus():
-    """Calculates click bonus based on points > 1 Sp, with diminishing returns."""
-    global points, g
-    current_points = points if isinstance(points, (int, float)) and not ma.isnan(points) and not ma.isinf(points) else 0.0
-    if current_points <= POINT_THRESHOLD_SP: return 1.0
+    cur_pts = pts if ma.isfinite(pts) else 0.0
+    if cur_pts <= POINT_THRESHOLD_SP: return 1.0
     try:
-        # Prevent log errors with 0 or negative points
-        if current_points <= 0: return 1.0
-        # Use max with a small positive number to prevent log10(<=0)
-        orders = ma.log10(max(1e-300, current_points / POINT_THRESHOLD_SP))
-
-        # C4 reward doesn't affect this scaling, it affects the PPS scaling exponent floor
-        # Ensure log10 arg > 0 by using max(0, orders)
-        dampened_exponent = ma.log10(max(0, orders) + 1.0) * 2.0 # Soft cap exponent
-        return max(1.0, 2.0 ** dampened_exponent)
-    except (ValueError, OverflowError) as e:
-        logging.warning(f"Click point bonus calculation error: {e}")
-        return 1.0
+        if cur_pts <= 0: return 1.0
+        orders = ma.log10(max(1e-300, cur_pts / POINT_THRESHOLD_SP))
+        damp_exp = ma.log10(max(0, orders) + 1.0) * 2.0
+        try:
+            bonus = 2.0 ** damp_exp
+            return max(1.0, bonus)
+        except OverflowError: return float('inf')
+    except (ValueError, OverflowError): return 1.0
 
 def get_upgrade_cost_scale_mult():
-    """Combined cost scaling multiplier factor from temporary challenge effects."""
-    # This returns the *temporary* increase from C5 effect
-    return g.chal_eff_cost_exp_mod # Only return temporary effect here
+    base_scale = g.chal_eff_cst_exp_mod
+    reward_scale = g.chal_upg_cst_scale_mult
+    return base_scale * reward_scale
 
-def get_upgrade2_factor(g_state): # Pass g_state to avoid potential global issues
-    """Calculates the base multiplier factor for Upgrade 2."""
-    base = 1.10
-    # P14 boost effect is multiplicative on the base factor's *gain* (e.g. 1.1 -> 1.15)
+def get_upgrade2_factor():
     gain = 0.10
-    if g_state.pur_cnt >= 14:
-         p_boost = g_state.p19_boost if g_state.pur_cnt >= 19 else 1.0 # P19 boosts P14
-         # P14 adds +50% gain, potentially boosted by P19
-         gain *= (1.0 + 0.5 * p_boost)
-
+    if g.pur_cnt >= 14:
+        p19_factor = g.p19_bst if g.pur_cnt >= 19 else 1.0
+        gain *= (1.0 + 0.5 * p19_factor)
     return 1.0 + gain
 
-
 def recalculate_multiplier_strength():
-    """Recalculates the strength multiplier from Upg2 levels."""
-    global g
-    factor = get_upgrade2_factor(g) # Use the helper function
-
-    # P17 effect: Boosts R4 effect based on Upg1 levels
-    p17_eff_boost = 1.0
-    if g.pur_cnt >= 17:
-         # Use g.p17_u1_boost which holds the P19 adjusted boost factor
-         # Example: Each Upg1 adds 0.2% effectiveness to R4 boost, factor included in p17_u1_boost
-         p17_eff_boost = (1.0 + g.upg1_lvl * 0.002 * g.p17_u1_boost) # Apply P17 boost factor here
-
-    # Apply P17 boost to the Rank 4 multiplier (g.r4_u2_boost is base R4 effect)
-    effective_r4_boost = g.r4_u2_boost * p17_eff_boost
-
+    factor = get_upgrade2_factor()
+    p17_bst = (1.0 + g.upg1_lvl * 0.002 * g.p17_u1_bst) if g.pur_cnt >= 17 else 1.0
+    eff_r4_bst = g.r4_u2_bst * p17_bst
     try:
-        g.mult_str = (factor ** g.upg2_lvl) * effective_r4_boost
-    except OverflowError:
-        g.mult_str = float('inf')
-        logging.warning("Overflow calculating multiplier strength.")
+        lvl = int(g.upg2_lvl)
+        g.mult_str = (factor ** lvl) * eff_r4_bst
+    except OverflowError: g.mult_str = float('inf')
+    except ValueError: g.mult_str = 1.0 # Fallback if level is invalid
 
 def calculate_point_per_second():
-    global pps, g
-    _pps = 0.0
+    global pps, g; _pps = 0.0
     try:
-        # --- Calculate Relic Bonuses First ---
-        relic_point_mult = get_relic_effect('relic_pt_mult', 1.0)
-        relic_p6_exp_mult = get_relic_effect('relic_p6_exp', 1.0)
-        relic_click_mult = get_relic_effect('relic_clk_mult', 1.0)
+        relic_pt_m = get_relic_effect('relic_pt_mult')
+        relic_p6_exp_m = get_relic_effect('relic_p6_exp')
+        relic_clk_m = get_relic_effect('relic_clk_mult')
+        asc_pt_bst = g.get_asc_pt_boost()
+        asc_clk_bst = g.get_asc_clk_boost()
+        nf_pt_bst = g.get_nf_point_boost()
 
-        # --- Ascension Boosts ---
-        asc_point_boost = g.get_asc_pt_boost()
-        asc_click_boost = g.get_asc_clk_boost() # Needed for click contribution
+        eff_clk_pow = float('inf')
+        if not any(ma.isinf(v) for v in [g.clk_pow, g.chal_perm_clk_bst, asc_clk_bst, g.clk_pt_scale, relic_clk_m]):
+            try: eff_clk_pow = g.clk_pow * g.chal_perm_clk_bst * asc_clk_bst * g.clk_pt_scale * relic_clk_m
+            except OverflowError: pass # Stays inf
 
-        # --- Calculate Base PPS ---
-        # P11 adds based on effective click power
-        effective_click_power = g.clk_pow * g.chal_perm_clk_boost * asc_click_boost * g.clk_pt_scale * relic_click_mult
-        base_pps_from_clicks = effective_click_power * g.p11_pps_boost if g.pur_cnt >= 11 else 0.0
-        base_pps = 1.0 + base_pps_from_clicks
+        base_pps_clk = 0.0
+        if g.pur_cnt >= 11 and g.p11_pps_bst > 0:
+            if ma.isinf(eff_clk_pow): base_pps_clk = float('inf')
+            else:
+                 try: base_pps_clk = eff_clk_pow * g.p11_pps_bst
+                 except OverflowError: base_pps_clk = float('inf')
 
-        # --- Apply Multipliers ---
-        effective_multiplier = g.mult * g.mult_str
-        _pps = base_pps * effective_multiplier * g.r1_boost
+        base_pps = 1.0 + base_pps_clk
+        eff_mult = g.mult * g.mult_str
 
-        # P6 effect: raise boost to relic exponent
+        _pps = base_pps
+        multipliers = [eff_mult, g.r1_bst, nf_pt_bst, asc_pt_bst, relic_pt_m]
+
         if g.r6_unl:
-             try: _pps *= (g.r6_boost ** relic_p6_exp_mult)
-             except OverflowError: _pps = float('inf')
+            try:
+                 bst_r6 = (g.r6_bst ** relic_p6_exp_m) if not (ma.isinf(g.r6_bst) or ma.isinf(relic_p6_exp_m)) else float('inf')
+                 multipliers.append(bst_r6)
+            except OverflowError: multipliers.append(float('inf'))
 
-        _pps *= g.cr1_boost # C1 boost
-        _pps *= g.cryst_comp_bonus # P13 boost
+        multipliers.extend([g.cr1_bst, g.cryst_comp_bst])
+        if g.pur_cnt >= 19: multipliers.append(g.p19_bst)
 
-        # P19 boost (applied here multiplicatively to previous P effects implicitly included)
-        if g.pur_cnt >= 19: _pps *= g.p19_boost
+        if g.cr5_comp and g.upg6_comp:
+            multipliers.append(calculate_playtime_multiplier())
 
-        # Playtime boost (C5 + Upg6)
-        if g.cr5_comp and g.upg6_comp: _pps *= calculate_playtime_multiplier()
+        for m in multipliers:
+            if ma.isinf(_pps) or ma.isinf(m):
+                 _pps = float('inf'); break
+            try: _pps *= m
+            except OverflowError: _pps = float('inf'); break
+        if ma.isinf(_pps): pps = float('inf'); return
 
-        # Apply major multipliers last
-        _pps *= asc_point_boost # Ascension Level Boost
-        _pps *= relic_point_mult # Relic Point Multiplier
+        if _pps > 0:
+            try:
+                total_exp = 1.0
+                exponents = [g.cr2_bst, g.pps_exp, g.pps_pt_scale_exp, g.chal_eff_pps_exp_mod]
+                for e in exponents:
+                    if e != 1.0: total_exp *= e
 
-        # Check for infinity before applying exponents
-        if ma.isinf(_pps):
-             pps = float('inf')
-             return # Skip exponents if already infinite
+                if total_exp != 1.0:
+                     if _pps <= 0: _pps = 0.0
+                     else: _pps **= total_exp
+            except OverflowError: _pps = float('inf')
+            except ValueError: _pps = 0.0
+        elif _pps < 0: _pps = 0.0
 
-        # --- Apply Exponents ---
-        # C2 exponent
-        if g.cr2_boost != 1.0: _pps = _pps ** g.cr2_boost if _pps > 0 else 0
-        # Upg3 exponent
-        if g.pps_exp != 1.0: _pps = _pps ** g.pps_exp if _pps > 0 else 0
-        # Point scaling exponent (soft cap)
-        if g.pps_pt_scale_exp < 1.0: _pps = _pps ** g.pps_pt_scale_exp if _pps > 0 else 0
-
-        # --- Apply Challenge Effects Last ---
-        # C4 power limit
-        if g.chal_eff_pps_exp_mod != 1.0:
-             _pps = _pps ** g.chal_eff_pps_exp_mod if _pps > 0 else 0
-
-    except (ValueError, OverflowError) as e:
-        logging.warning(f"PPS calculation error: {e}. PPS intermediate value={_pps}")
-        _pps = float('inf') if isinstance(e, OverflowError) else 0.0 # Assume Inf on overflow, 0 otherwise
     except Exception as e:
-         logging.error(f"Unexpected error in PPS calculation: {e}", exc_info=True)
+         logging.error(f"PPS calc error: {e}", exc_info=True)
          _pps = 0.0
 
-    # Final PPS assignment
-    pps = _pps if isinstance(_pps, (int, float)) and not ma.isnan(_pps) else 0.0
-    # Cap PPS reasonably if needed? For now, allow infinity.
-    # pps = min(pps, 1e308) # Example cap
-
+    pps = _pps if ma.isfinite(_pps) else (float('inf') if _pps > 0 else 0.0)
+    # logging.debug(f"Calculated PPS: {pps}") # DEBUG Line
 
 def calculate_playtime_multiplier():
-    """Calculates the multiplier based on playtime (logarithmic)."""
-    global g
-    playtime_sec = g.playtime if isinstance(g.playtime, (int, float)) else 0
-    if playtime_sec <= 0: return 1.0
+    play_s = g.playtime if isinstance(g.playtime,(int,float)) else 0
+    if play_s <= 0: return 1.0
     try:
-        # Ensure argument to log is positive
-        minutes_played = max(1e-9, playtime_sec / 60.0) # Use small positive if playtime is tiny
-        bonus = ma.log(minutes_played + 1) + 1.0 # Use log(minutes+1)
+        mins = max(1e-9, play_s / 60.0)
+        bonus = ma.log10(mins + 1) + 1.0
         return max(1.0, round(bonus, 3))
-    except (ValueError, OverflowError) as e:
-        logging.warning(f"Playtime multiplier calculation error: {e}")
-        return 1.0
-
+    except (ValueError, OverflowError): return 1.0
 
 def recalculate_derived_values():
-    """Recalculates all game values that depend on multiple base stats or upgrades."""
-    global g, points
-
-    # Reset temporary challenge effects before recalculating
-    g.chal_eff_pps_exp_mod = 1.0
-    g.chal_eff_cost_exp_mod = 1.0 # Reset cost exponent mod
+    global g, pts
+    g.chal_eff_pps_exp_mod, g.chal_eff_cst_exp_mod = 1.0, 1.0
     if g.active_chal and g.active_chal in CHALLENGES:
-        effect_func = CHALLENGES[g.active_chal].get('effect_func')
-        if effect_func:
-            try:
-                effect_func(g) # Apply active challenge effect (e.g., sets chal_eff_pps_exp_mod for C4)
-            except Exception as e:
-                logging.error(f"Error applying challenge {g.active_chal} effect: {e}")
+        eff_func = CHALLENGES[g.active_chal].get('ef')
+        if eff_func:
+            try: eff_func(g)
+            except Exception as e: logging.error(f"Chal {g.active_chal} effect error: {e}")
 
-    # --- Calculate Relic Bonuses ---
-    relic_p6_exp_mult = get_relic_effect('relic_p6_exp', 1.0)
-    relic_clk_mult = get_relic_effect('relic_clk_mult', 1.0)
-    relic_crit_c_bonus = get_relic_effect('relic_crit_c', 0.0) # Additive crit chance
+    p19f = g.p19_bst if g.pur_cnt >= 19 else 1.0
+    g.r6_bst = ((1.0 + g.pur_cnt)**2.0) if g.r6_unl else 1.0
+    g.p11_pps_bst = 0.001 * p19f if g.pur_cnt >= 11 else 0.0
+    g.cryst_comp_bst = 1.0 + (g.cryst_cnt * 0.05 * p19f) if g.pur_cnt >= 13 else 1.0
+    g.p16_cst_reduc = max(0.5, 1.0 - (g.cryst_cnt * 0.005 * p19f)) if g.pur_cnt >= 16 else 1.0
+    g.p17_u1_bst = p19f if g.pur_cnt >= 17 else 1.0
+    g.p18_pass_clk = 0.01 * p19f if g.pur_cnt >= 18 else 0.0
+    g.p24_pur_cst_div = max(1.0, ma.sqrt(max(0,g.pur_cnt)) * p19f) if g.pur_cnt >= 24 else 1.0
 
-    # --- Ascension Boosts ---
-    asc_point_boost = g.get_asc_pt_boost()
-    asc_click_boost = g.get_asc_clk_boost()
-
-    # --- Purify Based Effects ---
-    # P19 boost factor - used by other P effects
-    p19_boost_factor = g.p19_boost if g.pur_cnt >= 19 else 1.0
-
-    # P6 base effect
-    g.r6_boost = ((1.0 + g.pur_cnt)**2.0) if g.r6_unl else 1.0
-
-    # Apply P19 boost to relevant P-rewards *factors* where applicable
-    g.p11_pps_boost = 0.001 * p19_boost_factor if g.pur_cnt >= 11 else 0.0
-    g.cryst_comp_bonus = 1.0 + (g.cryst_cnt * 0.05 * p19_boost_factor) if g.pur_cnt >= 13 else 1.0
-    g.p14_u2_boost = 1.0 + (0.5 * p19_boost_factor) if g.pur_cnt >= 14 else 1.0 # Boosts the gain part (+50%)
-    g.p16_cost_reduc = max(0.5, 1.0 - (g.cryst_cnt * 0.005 * p19_boost_factor)) if g.pur_cnt >= 16 else 1.0
-    g.p17_u1_boost = p19_boost_factor if g.pur_cnt >= 17 else 1.0 # This factor boosts the P17 effect in mult_str calc
-    g.p18_pass_clk = 0.01 * p19_boost_factor if g.pur_cnt >= 18 else 0.0
-    # Disable P18 if in C7 (handled by effect_func now)
-    # if g.active_chal == 'c7': g.p18_pass_clk = 0.0
-    g.p24_pur_cost_div = max(1.0, ma.sqrt(max(0,g.pur_cnt)) * p19_boost_factor) if g.pur_cnt >= 24 else 1.0
-
-
-    # --- Point Scaling Exponent (Soft Cap) ---
-    g.clk_pt_scale = calculate_click_point_bonus() # Click scaling based on points
-    current_points_safe = points if isinstance(points, (int, float)) and not ma.isnan(points) and not ma.isinf(points) else 0.0
-    g.pps_pt_scale_exp = 1.0 # Default exponent
-
-    # C4 reward improves the *floor* of the exponent, not the reduction strength
-    c4_completions = g.chal_comps.get('c4', 0)
-    c4_floor_bonus = 0.001 * c4_completions # +0.001 to floor per C4 completion
-
-    if current_points_safe > POINT_THRESHOLD_SP:
+    g.clk_pt_scale = calculate_click_point_bonus()
+    cur_pts_safe = pts if ma.isfinite(pts) else 0.0
+    g.pps_pt_scale_exp = 1.0
+    if cur_pts_safe > POINT_THRESHOLD_SP:
         try:
-            if current_points_safe <= 0: # Avoid log error
-                 orders = -300 # Arbitrarily large negative order
-            else:
-                 orders = ma.log10(max(1e-300, current_points_safe / POINT_THRESHOLD_SP))
-
-            red_str = 0.05 if g.p20_lim_brk else 0.02 # Reduction strength
-            base_min_exp = 0.3 if g.p20_lim_brk else 0.5 # Base floor
-            final_min_exp = min(1.0, base_min_exp + c4_floor_bonus) # Apply C4 reward to floor
-
-            # Calculate target exponent based on reduction
+            orders = ma.log10(max(1e-300, cur_pts_safe / POINT_THRESHOLD_SP)) if cur_pts_safe > 0 else -300
+            red_str = 0.05 if g.p20_lim_brk else 0.02
+            base_min = 0.3 if g.p20_lim_brk else 0.5
             target_exp = 1.0 - (ma.log10(max(0, orders) + 1.0) * red_str)
-            g.pps_pt_scale_exp = max(final_min_exp, target_exp) # Apply floor
+            g.pps_pt_scale_exp = max(base_min, target_exp) # Use base_min directly
+        except (ValueError, OverflowError):
+            g.pps_pt_scale_exp = 0.3 if g.p20_lim_brk else 0.5
 
-        except (ValueError, OverflowError): pass # Keep 1.0 on error
-
-
-    # --- Click Effects ---
-    g.clk_crit_c = min(1.0, (0.05 * g.upg7_lvl) + relic_crit_c_bonus ) # Add relic bonus
+    relic_crit_c = get_relic_effect('relic_crit_c', 0.0) # NF boost included
+    g.clk_crit_c = min(1.0, (0.05 * g.upg7_lvl) + relic_crit_c)
     g.clk_crit_m = 2.0 + (0.2 * g.upg7_lvl)
-    # Use clk_pow, chal_perm_clk_boost, asc_click_boost, clk_pt_scale
-    effective_base_click = g.clk_pow * g.chal_perm_clk_boost * asc_click_boost * g.clk_pt_scale * relic_clk_mult
-    base_auto_click = effective_base_click * (0.01 * g.upg8_lvl)
-    passive_click_from_p18 = effective_base_click * g.p18_pass_clk if g.p18_pass_clk > 0 else 0.0
-    # Disable auto-clickers if in C7 (Handled by effect_func setting p18_pass_clk to 0)
-    g.auto_cps = base_auto_click + passive_click_from_p18
-    if g.active_chal == 'c7': g.auto_cps = 0.0
 
+    relic_clk_m = get_relic_effect('relic_clk_mult') # NF boost included
+    asc_clk_bst = g.get_asc_clk_boost()
+    eff_base_clk = float('inf')
+    if not any(ma.isinf(v) for v in [g.clk_pow, g.chal_perm_clk_bst, asc_clk_bst, g.clk_pt_scale, relic_clk_m]):
+        try: eff_base_clk = g.clk_pow * g.chal_perm_clk_bst * asc_clk_bst * g.clk_pt_scale * relic_clk_m
+        except OverflowError: pass
 
-    # --- Recalc Dependent Values ---
-    recalculate_multiplier_strength() # Depends on Upg1/2 levels, R4, P17
-    calculate_point_per_second() # Depends on almost everything
+    base_auto, pass_auto = 0.0, 0.0
+    if ma.isinf(eff_base_clk):
+        base_auto = float('inf') if (0.01 * g.upg8_lvl) > 0 else 0.0
+        pass_auto = float('inf') if g.p18_pass_clk > 0 else 0.0
+    else:
+        try: base_auto = eff_base_clk * (0.01 * g.upg8_lvl)
+        except OverflowError: base_auto = float('inf')
+        try: pass_auto = eff_base_clk * g.p18_pass_clk if g.p18_pass_clk > 0 else 0.0
+        except OverflowError: pass_auto = float('inf')
+    g.auto_cps = float('inf') if ma.isinf(base_auto) or ma.isinf(pass_auto) else base_auto + pass_auto
 
-    # --- Update Max Purify/Crystalline ---
+    recalculate_multiplier_strength()
+    calculate_point_per_second()
+
     g.pur_max = 20 if g.cr5_comp else (15 if g.upg5_comp else 10)
-    g.cryst_max = 5 if g.pur_cnt >= 15 else 4 # C5 requires P15
-
-    logging.debug(f"Derived recalculated (PPS Scale Exp: {g.pps_pt_scale_exp:.3f}, Asc Lvl: {g.asc_lvl}, Chal: {g.active_chal})")
-
+    g.cryst_max = 5 if g.pur_cnt >= 15 else 4
+    g.check_celestiality_unlock()
+    # Removed debug log for cleaner output, re-enable if needed
 
 # --- Game Loop Logic ---
 def game_tick():
-    global points, clicks, pps, g
+    global pts, clks, pps, g
     try:
-        # Ensure values are numeric and finite before calculations
-        _pps = pps if isinstance(pps, (int, float)) and ma.isfinite(pps) else 0.0
-        current_points = points if isinstance(points, (int, float)) and ma.isfinite(points) else 0.0
-        current_clicks = clicks if isinstance(clicks, (int, float)) and ma.isfinite(clicks) else 0.0
-        _cps = g.auto_cps if isinstance(g.auto_cps, (int, float)) and ma.isfinite(g.auto_cps) else 0.0
+        _pps = pps if ma.isfinite(pps) else 0.0
+        cur_pts = pts if ma.isfinite(pts) else 0.0
+        cur_clks = clks if ma.isfinite(clks) else 0.0
+        _cps = g.auto_cps if ma.isfinite(g.auto_cps) else 0.0
 
-        # Add gains, check for overflow
+        pts_gain = _pps * TICK_INTERVAL_S
+        clks_gain = _cps * TICK_INTERVAL_S
+
         try:
-            points = min(float('inf'), current_points + _pps * TICK_INTERVAL_S)
-        except OverflowError: points = float('inf')
+            if ma.isinf(cur_pts) and cur_pts > 0: pts = float('inf')
+            elif ma.isinf(pts_gain) and pts_gain > 0: pts = float('inf')
+            elif ma.isfinite(cur_pts) and ma.isfinite(pts_gain):
+                 next_pts = cur_pts + pts_gain
+                 pts = float('inf') if ma.isinf(next_pts) else next_pts
+            else: pts = cur_pts
+        except OverflowError: pts = float('inf')
+
         try:
-             clicks = min(float('inf'), current_clicks + _cps * TICK_INTERVAL_S)
-        except OverflowError: clicks = float('inf')
+            if ma.isinf(cur_clks) and cur_clks > 0: clks = float('inf')
+            elif ma.isinf(clks_gain) and clks_gain > 0: clks = float('inf')
+            elif ma.isfinite(cur_clks) and ma.isfinite(clks_gain):
+                 next_clks = cur_clks + clks_gain
+                 clks = float('inf') if ma.isinf(next_clks) else next_clks
+            else: clks = cur_clks
+        except OverflowError: clks = float('inf')
 
         g.playtime += TICK_INTERVAL_S
 
-        # Check active challenge completion (throttled)
-        if g.active_chal and int(g.playtime * 10) % 10 == 0: # Check roughly every second
-            check_challenge_completion()
+        if g.needs_recalc_from_click_xp:
+            recalculate_derived_values()
+            g.needs_recalc_from_click_xp = False
 
-    except Exception as e: logging.error(f"Error in game_tick: {e}", exc_info=True)
+        if g.active_chal and int(g.playtime / TICK_INTERVAL_S) % int(1/TICK_INTERVAL_S) == 0:
+             check_challenge_completion()
+
+    except Exception as e: logging.error(f"Tick error: {e}", exc_info=True)
 
 def game_loop_thread_func():
     logging.info("Game loop thread started.")
     while is_running:
         start = time.monotonic()
-        try:
-            game_tick()
+        try: game_tick()
         except Exception as e:
-             logging.error(f"Unhandled exception in game_tick caught by loop: {e}", exc_info=True)
-             # Potentially add a small delay here to prevent tight error loops
+             logging.error(f"Tick loop error: {e}", exc_info=True)
              time.sleep(1)
-
         elapsed = time.monotonic() - start
-        # Ensure sleep time is non-negative
         sleep_duration = max(0, TICK_INTERVAL_S - elapsed)
         time.sleep(sleep_duration)
     logging.info("Game loop thread finished.")
 
-
-# --- Upgrade Functions (Apply Cost Scaling Multiplier) ---
-def get_effective_cost_factor(base_factor):
-     """Applies challenge cost scaling modifications."""
-     # C5 Temporary effect increases the factor
-     temp_factor_mult = get_upgrade_cost_scale_mult() # From chal_eff_cost_exp_mod
-     # C5 Permanent reward decreases the factor (g.chal_upg_cost_scale_mult is < 1)
-     perm_factor_mult = g.chal_upg_cost_scale_mult
-     return base_factor * temp_factor_mult * perm_factor_mult
+# --- Upgrade Functions ---
+def get_effective_cost_factor(base):
+    chal_eff_scale = g.chal_eff_cst_exp_mod
+    chal_rew_scale = g.chal_upg_cst_scale_mult
+    return base * chal_eff_scale * chal_rew_scale
 
 def upgrade1():
-    global points, g
-    cost = g.upg1_cost
-    # Check level against float max
-    if g.upg1_lvl >= g.upg1_max or points < cost: return
-
-    # Avoid issues if cost is inf
-    if ma.isinf(cost): return
-
-    points -= cost
-    g.upg1_lvl += 1
-    relic_u1_bonus = get_relic_effect('relic_u1_str', 0.0) # Additive bonus
-    g.mult += (1.0 + relic_u1_bonus) # Apply additive bonus from relic
-    level_factor = get_effective_cost_factor(1.15) # Base factor 1.15, modified by C5 stuff
-    # Use r3_cost_m, p16_cost_reduc
-    reduction = g.r3_cost_m * g.p16_cost_reduc
-    try:
-        g.upg1_cost = round(10.0 * (level_factor ** g.upg1_lvl) * reduction, 2)
-    except OverflowError:
-        g.upg1_cost = float('inf')
+    global pts, g; cst = g.upg1_cst
+    try: lvl = int(g.upg1_lvl); max_lvl = int(g.upg1_max)
+    except ValueError: return # Invalid level/max
+    if lvl >= max_lvl or pts < cst or ma.isinf(cst): return
+    pts -= cst; g.upg1_lvl += 1; g.mult += (1.0 + get_relic_effect('relic_u1_str', 0.0))
+    factor = get_effective_cost_factor(1.15)
+    reduc = g.r3_cst_m * g.p16_cst_reduc
+    try: g.upg1_cst = round(10.0 * (factor ** g.upg1_lvl) * reduc, 2)
+    except OverflowError: g.upg1_cst = float('inf')
     recalculate_derived_values()
 
 def upgrade2():
-    global points, g
-    # Check challenge restrictions (C1)
-    if g.active_chal == 'c1': return
-    cost = g.upg2_cost
-    if g.upg2_lvl >= g.upg2_max or points < cost: return
-    if ma.isinf(cost): return
-
-    points -= cost
-    g.upg2_lvl += 1
-    level_factor = get_effective_cost_factor(1.25) # Base factor 1.25
-    reduction = g.r3_cost_m * g.p16_cost_reduc
-    try:
-        g.upg2_cost = round(100.0 * (level_factor ** g.upg2_lvl) * reduction, 2)
-    except OverflowError:
-        g.upg2_cost = float('inf')
+    global pts, g; cst = g.upg2_cst
+    try: lvl = int(g.upg2_lvl); max_lvl = int(g.upg2_max)
+    except ValueError: return
+    if g.active_chal == 'c1' or lvl >= max_lvl or pts < cst or ma.isinf(cst): return
+    pts -= cst; g.upg2_lvl += 1
+    factor = get_effective_cost_factor(1.25)
+    reduc = g.r3_cst_m * g.p16_cst_reduc
+    try: g.upg2_cst = round(100.0 * (factor ** g.upg2_lvl) * reduc, 2)
+    except OverflowError: g.upg2_cst = float('inf')
     recalculate_derived_values()
 
 def upgrade3():
-    global points, g
-    # Check challenge restrictions (C3)
-    if g.active_chal == 'c3': return
-    cost = g.upg3_cost
-    if g.upg3_lvl >= g.upg3_max or points < cost: return
-    if ma.isinf(cost): return
-
-    points -= cost
-    g.upg3_lvl += 1
-    # Use r5_u3_boost
-    base_gain = 0.05 + g.r5_u3_boost
-    relic_u3_mult = get_relic_effect('relic_u3_eff', 1.0) # Multiplicative bonus from relic
-    base_gain *= relic_u3_mult
-
-    threshold = 2.0
-    reduction_factor = 0.1
-    effective_gain = base_gain
-    if g.pps_exp > threshold: effective_gain *= reduction_factor
-    if g.p20_lim_brk: effective_gain *= reduction_factor # Double reduction
-    g.pps_exp += max(0.001, effective_gain) # Apply soft-capped gain
-    level_factor = get_effective_cost_factor(1.35) # Base factor 1.35
-    reduction = g.r3_cost_m * g.p16_cost_reduc
-    try:
-        g.upg3_cost = round(10000.0 * (level_factor ** g.upg3_lvl) * reduction, 2)
-    except OverflowError:
-        g.upg3_cost = float('inf')
+    global pts, g; cst = g.upg3_cst
+    try: lvl = int(g.upg3_lvl); max_lvl = int(g.upg3_max)
+    except ValueError: return
+    if g.active_chal == 'c2' or lvl >= max_lvl or pts < cst or ma.isinf(cst): return
+    pts -= cst; g.upg3_lvl += 1
+    gain = 0.05 + g.r5_u3_bst
+    relic_m = get_relic_effect('relic_u3_eff', 1.0) # NF boost included
+    if ma.isinf(relic_m): gain = float('inf')
+    elif ma.isfinite(relic_m): gain *= relic_m
+    eff_gain = gain
+    softcap_exponent = 2.0
+    diminishing_factor = 0.1
+    limit_break_factor = 0.1
+    if g.pps_exp > softcap_exponent: eff_gain *= diminishing_factor
+    if g.p20_lim_brk: eff_gain *= limit_break_factor
+    if ma.isinf(eff_gain): g.pps_exp = float('inf')
+    elif ma.isfinite(g.pps_exp): g.pps_exp += max(0.001, eff_gain)
+    factor = get_effective_cost_factor(1.35)
+    reduc = g.r3_cst_m * g.p16_cst_reduc
+    try: g.upg3_cst = round(10000.0 * (factor ** g.upg3_lvl) * reduc, 2)
+    except OverflowError: g.upg3_cst = float('inf')
     recalculate_derived_values()
 
 def upgrade4():
-    global points, g
-    cost = g.upg4_cost
-    if not g.cr1_u4_unl: return # Use cr1_u4_unl
-    if g.upg4_lvl >= g.upg4_max or points < cost: return
-    if ma.isinf(cost): return
-
-    points -= cost
-    g.upg4_lvl += 1
-    g.upg3_max += 1.0 # Still increases Upg3 max
-    level_factor = get_effective_cost_factor(1.50) # Base factor 1.5
-    reduction = g.p16_cost_reduc # No R3 mult here
-    try:
-        g.upg4_cost = round(10000000.0 * (level_factor ** g.upg4_lvl) * reduction, 2)
-    except OverflowError:
-        g.upg4_cost = float('inf')
-    # No recalc needed? Upg4 effect is passive on Upg3 max, cost update is enough.
-    # Let's add recalc just in case future effects depend on Upg4 level.
+    global pts, g; cst = g.upg4_cst
+    try: lvl = int(g.upg4_lvl); max_lvl = int(g.upg4_max)
+    except ValueError: return
+    if not g.cr1_u4_unl or lvl >= max_lvl or pts < cst or ma.isinf(cst): return
+    pts -= cst; g.upg4_lvl += 1; g.upg3_max += 1.0
+    factor = get_effective_cost_factor(1.50)
+    reduc = g.p16_cst_reduc
+    try: g.upg4_cst = round(10000000.0 * (factor ** g.upg4_lvl) * reduc, 2)
+    except OverflowError: g.upg4_cst = float('inf')
     recalculate_derived_values()
 
-
-def upgrade5(): # Click Upg
-    global clicks, g
-    req = 100.0
-    if not g.cr4_unl or g.upg5_comp: return # Use cr4_unl, upg5_comp
-    if clicks >= req:
-        # clicks -= req # Typically click upgrades don't consume clicks? Keep if intended.
-        g.upg5_comp = True
-        g.pur_max = 15 # Still unlocks P11-15
-        logging.info("Upg5 Done!")
-        recalculate_derived_values() # Update pur_max etc.
-    else: logging.debug(f"Need {format_number(req - clicks)} clicks for Upg5")
-
-def upgrade6(): # Click Upg
-    global clicks, g
-    req = 100000.0
-    if not g.cr4_unl or g.upg6_comp: return # Use cr4_unl, upg6_comp
-    if clicks >= req:
-        # clicks -= req
-        g.upg6_comp = True
-        logging.info("Upg6 Done!")
-        recalculate_derived_values() # Enables C5 playtime effect application
-    else: logging.debug(f"Need {format_number(req - clicks)} clicks for Upg6")
-
-def upgrade7(): # Click Upg - Crit
-    global clicks, g
-    cost = g.upg7_cost
-    if not g.cr4_unl: return
-    if g.upg7_lvl >= g.upg7_max or clicks < cost: return
-    if ma.isinf(cost): return
-
-    clicks -= cost # Consumes clicks
-    g.upg7_lvl += 1
-    try:
-        # Cost doesn't use the general factor, only upgrade 1-4 per C5 desc
-        g.upg7_cost *= 1.5
-    except OverflowError:
-        g.upg7_cost = float('inf')
+def upgrade5():
+    global clks, g; req = 10.0
+    if not g.cr4_unl or g.upg5_comp or clks < req: return
+    g.upg5_comp = True; g.pur_max = 15; logging.info("Upg5 Done! Purify Max -> 15.")
     recalculate_derived_values()
 
-def upgrade8(): # Click Upg - Auto
-    global clicks, g
-    # Check challenge restrictions (C7)
-    if g.active_chal == 'c7': return
-    cost = g.upg8_cost
-    if not g.cr4_unl: return
-    if g.upg8_lvl >= g.upg8_max or clicks < cost: return
-    if ma.isinf(cost): return
+def upgrade6():
+    global clks, g; req = 1000.0
+    if not g.cr4_unl or g.upg6_comp or clks < req: return
+    g.upg6_comp = True; logging.info("Upg6 Done! C5 Playtime Boost Active.")
+    recalculate_derived_values()
 
-    clicks -= cost # Consumes clicks
-    g.upg8_lvl += 1
-    try:
-         # Cost doesn't use the general factor
-        g.upg8_cost *= 2.0
-    except OverflowError:
-        g.upg8_cost = float('inf')
+def upgrade7():
+    global clks, g; cst = g.upg7_cst
+    try: lvl = int(g.upg7_lvl); max_lvl = int(g.upg7_max)
+    except ValueError: return
+    if not g.cr4_unl or lvl >= max_lvl or clks < cst or ma.isinf(cst): return
+    clks -= cst; g.upg7_lvl += 1
+    try: g.upg7_cst *= 1.5
+    except OverflowError: g.upg7_cst = float('inf')
+    recalculate_derived_values()
+
+def upgrade8():
+    global clks, g; cst = g.upg8_cst
+    try: lvl = int(g.upg8_lvl); max_lvl = int(g.upg8_max)
+    except ValueError: return
+    if not g.cr4_unl or lvl >= max_lvl or clks < cst or ma.isinf(cst): return
+    clks -= cst; g.upg8_lvl += 1
+    try: g.upg8_cst *= 2.0
+    except OverflowError: g.upg8_cst = float('inf')
     recalculate_derived_values()
 
 # --- Prestige Functions ---
-def apply_purification_effects(p_level_index):
-    global g, autobuy_thread # Use 'g'
-    p_num = p_level_index + 1
-
-    # --- Apply P effects based on p_num ---
-    if p_num == 1: g.r1_boost = 3.0
-    elif p_num > 1: g.r1_boost *= 2.0 # Subsequent purifies still boost Rank 1
-
-    if p_num == 2:
-        g.r2_unl = True
-        g.upg1_max += 1.0
-        g.upg2_max += 1.0
-    if p_num == 3:
-        g.r3_unl = True
-        g.r3_cost_m *= 0.95
-    if p_num == 4: g.r4_u2_boost = 3.0 # Base R4 effect
-    if p_num == 5: g.r5_u3_boost = 0.01
-    if p_num == 6: g.r6_unl = True
-    if p_num == 10: g.cryst_unl = True
-    if p_num == 12:
-        g.p12_auto_u4 = True
-        start_autobuy_thread_if_needed()
-    if p_num == 19: g.p19_boost = 1.25 # Set the P19 boost factor
+def apply_purification_effects(p_idx):
+    global g; p_num = p_idx + 1
+    if p_num == 1: g.r1_bst = 3.0
+    elif p_num > 1: g.r1_bst *= 2.0
+    if p_num == 2: g.r2_unl=True; g.upg1_max+=1.0; g.upg2_max+=1.0
+    if p_num == 3: g.r3_unl=True; g.r3_cst_m*=0.95
+    if p_num == 4: g.r4_u2_bst=3.0;
+    if p_num == 5: g.r5_u3_bst=0.01;
+    if p_num == 6: g.r6_unl=True;
+    if p_num == 10: g.cryst_unl=True;
+    if p_num == 12: g.p12_auto_u4=True; start_autobuy_thread_if_needed()
+    # P15 unlocks C5 requirement, no direct state change
+    if p_num == 19: g.p19_bst=1.25;
     if p_num == 20 and g.cr5_comp and not g.p20_lim_brk:
-        g.p20_lim_brk = True
-        levels_to_add = 10.0
-        g.upg1_max += levels_to_add
-        g.upg2_max += levels_to_add
-        logging.info(f"P20 Limit Break Activated! (+{int(levels_to_add)} Max Lvl Upg1 & Upg2)")
-    # P21 (Autobuy speed), P22 (SD Gain), P23 (Relic Cost) are applied elsewhere
+        g.p20_lim_brk=True; add=10.0; g.upg1_max+=add; g.upg2_max+=add
+        logging.info(f"P20 Limit Break! (+{int(add)} Max Upg1/2)")
+    g.check_celestiality_unlock()
 
-def apply_crystalline_effects(cry_level_achieved):
-    global g, autobuy_thread # Use 'g'
-    if cry_level_achieved == 1:
-        g.cr1_boost = 3.0
-        g.cr1_u4_unl = True
-    elif cry_level_achieved == 2: g.cr2_boost = 1.5
-    elif cry_level_achieved == 3:
-        g.cr3_unl = True
-        start_autobuy_thread_if_needed()
-    elif cry_level_achieved == 4: g.cr4_unl = True
-    elif cry_level_achieved == 5:
-        g.cr5_comp = True
-        g.asc_unl = True # Unlock Ascension
+def apply_crystalline_effects(cry_lvl):
+    global g
+    if cry_lvl == 1: g.cr1_bst=3.0; g.cr1_u4_unl=True
+    elif cry_lvl == 2: g.cr2_bst=1.5
+    elif cry_lvl == 3: g.cr3_unl=True; start_autobuy_thread_if_needed()
+    elif cry_lvl == 4: g.cr4_unl=True; g.clk_pow=100.0; logging.info(f"C4! Click Power -> {format_number(g.clk_pow)}")
+    elif cry_lvl == 5: g.cr5_comp=True; g.asc_unl=True
+    g.check_celestiality_unlock()
 
 # --- Reset Functions ---
-def reset_for_purify(keep_challenge_progress=False):
-    global points, g # Use 'g'
-    points = 0.0
-    # Reset upgrades
-    g.upg1_lvl = 0
-    g.upg1_cost = 10.0
-    g.upg2_lvl = 0
-    g.upg2_cost = 100.0
-    g.upg3_lvl = 0
-    g.upg3_cost = 10000.0
-    g.upg4_lvl = 0
-    g.upg4_cost = 10000000.0
-    # Reset multipliers/exponents
+def reset_for_purify(keep_chal=False):
+    global pts, g; pts = 0.0
+    g.upg1_lvl, g.upg1_cst = 0, 10.0
+    g.upg2_lvl, g.upg2_cst = 0, 100.0
+    g.upg3_lvl, g.upg3_cst = 0, 10000.0
+    g.upg4_lvl, g.upg4_cst = 0, 10000000.0
     g.mult = 1.0
-    g.pps_exp = 1.0
-    # Reset playtime unless specified otherwise (e.g., during challenge)
-    if not keep_challenge_progress: g.playtime = 0.0
+    g.pps_exp = 1.0 # Base exponent resets
+    if not keep_chal: g.playtime = 0.0
 
-    # Apply starting Upg1 levels if any (e.g. future source)
-    start_lvl1 = 0 # Placeholder for now
-    if start_lvl1 > 0:
-        temp_cost = 10.0
-        reduction = g.r3_cost_m * g.p16_cost_reduc
-        factor = get_effective_cost_factor(1.15)
-        relic_u1_bonus = get_relic_effect('relic_u1_str', 0.0)
-        for i in range(start_lvl1):
-            if g.upg1_lvl >= g.upg1_max: break # Respect max level
-            g.upg1_lvl += 1
-            g.mult += (1.0 + relic_u1_bonus)
-            try:
-                temp_cost = round(10.0 * (factor ** g.upg1_lvl) * reduction, 2)
-            except OverflowError:
-                temp_cost = float('inf')
-                break # Stop if cost becomes infinite
-        g.upg1_cost = temp_cost
-
-def reset_for_crystalline(keep_challenge_progress=False):
-    global points, g # Use 'g'
-    # Reset Purify progress
-    g.pur_cnt = 0
-    g.pur_cost = 1000.0
-    g.r1_boost = 1.0
-    g.r2_unl = False
-    g.r3_unl = False
-    # Keep permanent challenge reward for r3_cost_m if needed, or reset? Assuming reset for now.
-    g.r3_cost_m = 1.0 # Reset unless C3 reward logic changes
-    g.r4_u2_boost = 1.0
-    g.r5_u3_boost = 0.0
-    g.r6_unl = False
-    g.r6_boost = 1.0
-    # Reset P-based effects that are not permanent boosts
-    g.p11_pps_boost = 0.0
-    g.p12_auto_u4 = False
-    g.cryst_comp_bonus = 1.0
-    g.p14_u2_boost = 1.0 # Base value, recalculate applies boost
-    g.p16_cost_reduc = 1.0
-    g.p17_u1_boost = 1.0 # Base factor, recalculate applies boost
-    g.p18_pass_clk = 0.0
-    g.p19_boost = 1.0 # Base factor, recalculate applies boost
-    g.p20_lim_brk = False # Limit break is reset on Crystalline/Ascension
-    g.p24_pur_cost_div = 1.0
-    # Reset upgrade max levels (respect P2/P20 limit breaks)
-    # Max levels are reset to base, P2/P20 applied by Purify/Crystalline funcs if re-achieved
-    g.upg1_max = 25.0
-    g.upg2_max = 10.0
-    g.upg3_max = 10.0 # Upg4 additions reset here
-    g.upg4_max = 5.0
-    # Perform Purify reset
-    reset_for_purify(keep_challenge_progress=keep_challenge_progress)
-    # Keep Crystalline unlocked status
+def reset_for_crystalline(keep_chal=False):
+    global pts, g
+    g.pur_cnt, g.pur_cst, g.r1_bst, g.r2_unl, g.r3_unl = 0, 1000.0, 1.0, False, False
+    g.r3_cst_m, g.r4_u2_bst, g.r5_u3_bst, g.r6_unl, g.r6_bst = 1.0, 1.0, 0.0, False, 1.0
+    g.p11_pps_bst, g.p12_auto_u4, g.cryst_comp_bst = 0.0, False, 1.0
+    g.p16_cst_reduc, g.p17_u1_bst, g.p18_pass_clk, g.p19_bst = 1.0, 1.0, 0.0, 1.0
+    g.p20_lim_brk, g.p24_pur_cst_div = False, 1.0
+    g.upg1_max, g.upg2_max, g.upg3_max, g.upg4_max = 25.0, 10.0, 10.0, 5.0
+    reset_for_purify(keep_chal)
     g.cryst_unl = True
 
-def reset_for_ascension(keep_challenge_progress=False):
-    global points, clicks, g # Use 'g'
-    logging.info("Resetting for Ascension...")
-    points = 0.0
-    clicks = 0.0
-    # Reset Crystalline progress
-    g.cryst_cnt = 0
-    g.cryst_cost = 2.5e8
-    g.cr1_boost = 1.0
-    g.cr1_u4_unl = False
-    g.cr2_boost = 1.0
-    g.cr3_unl = False
-    g.cr4_unl = False
-    g.cr5_comp = False
-    # Reset Click Upgrades
-    g.upg5_comp = False
-    g.upg6_comp = False
-    g.upg7_lvl = 0
-    g.upg7_cost = 1e6
-    g.upg7_max = 50.0
-    g.upg8_lvl = 0
-    g.upg8_cost = 1e9
-    g.upg8_max = 100.0
-    g.clk_pow = 1.0 # Reset base click power
-    g.clk_crit_c = 0.0
-    g.clk_crit_m = 2.0
-    g.auto_cps = 0.0
-    # Perform Crystalline reset (which includes Purify reset)
-    reset_for_crystalline(keep_challenge_progress=keep_challenge_progress)
-    # Keep Ascension unlocked status
+def reset_for_ascension(keep_chal=False):
+    global pts, clks, g; logging.info("Resetting for Ascension...")
+    pts, clks = 0.0, 0.0
+    g.cryst_cnt, g.cryst_cst, g.cr1_bst, g.cr1_u4_unl = 0, 2.5e8, 1.0, False
+    g.cr2_bst, g.cr3_unl, g.cr4_unl, g.cr5_comp = 1.0, False, False, False
+    g.upg5_comp, g.upg6_comp = False, False
+    g.upg7_lvl, g.upg7_cst = 0, 1e4
+    g.upg8_lvl, g.upg8_cst = 0, 1e7
+    g.clk_pow, g.clk_crit_c, g.clk_crit_m, g.auto_cps = 1.0, 0.0, 2.0, 0.0
+    reset_for_crystalline(keep_chal)
     g.asc_unl = True
-    # Keep Challenge completions and active challenge state unless specified
-    if not keep_challenge_progress:
-        g.active_chal = None # Exit challenge on Ascension typically
+    if not keep_chal: g.active_chal = None
 
-# --- Task 6: Challenge Reset ---
-def reset_for_challenge(challenge_id):
-    global g
-    chal_data = CHALLENGES.get(challenge_id)
-    if not chal_data:
-        logging.error(f"Attempted to reset for unknown challenge: {challenge_id}")
-        return
+def reset_for_celestiality(keep_chal=False):
+    global g, pts, clks; logging.info("Resetting for Celestiality (Full Reset)...")
+    # Reset Ascension
+    g.sd = 0.0; g.asc_lvl = 0; g.asc_xp = 0.0; g.asc_cnt = 0; g.asc_first = False
+    # Reset Relics & Challenges
+    g.relic_lvls.clear(); g.chal_comps.clear()
+    g.chal_sd_bst = 1.0; g.chal_perm_clk_bst = 1.0; g.chal_upg_cst_scale_mult = 1.0
+    # Reset C2 reward affecting Upg3 cost
+    g.r3_cst_m = 1.0
+    # Perform lower resets
+    reset_for_ascension(keep_chal)
+    # Ensure Celestiality stays unlocked but keep NF/Count
+    g.celest_unl = True
+    logging.info("Celestiality Reset: SD, Asc Lvl/XP/Count, Relics, Challenges reset.")
 
-    reset_type = chal_data.get('reset_level', 'ascension') # Default to full reset
-    logging.info(f"Entering Challenge '{challenge_id}'. Performing '{reset_type}' reset.")
+def reset_for_challenge(cid):
+    global g; chal_data = CHALLENGES.get(cid)
+    if not chal_data: return
+    reset_type = chal_data.get('rl', 'asc').lower()
+    logging.info(f"Entering Chal '{cid}'. Reset: '{reset_type}'.")
+    # Preserve state surviving the reset
+    _celest_cnt, _neb_frag, _celest_cst, _celest_unl = g.celest_cnt, g.nebula_fragments, g.celest_cst, g.celest_unl
+    _lvl, _xp, _first, _sd, _asc_cnt = g.asc_lvl, g.asc_xp, g.asc_first, g.sd, g.asc_cnt
+    _rl, _cc = g.relic_lvls.copy(), g.chal_comps.copy()
+    _sb, _cb, _cm = g.chal_sd_bst, g.chal_perm_clk_bst, g.chal_upg_cst_scale_mult
 
-    # Preserve state that should NOT be reset by challenges
-    _asc_lvl = g.asc_lvl
-    _asc_xp = g.asc_xp
-    _asc_first = g.asc_first
-    _relic_lvls = g.relic_lvls.copy()
-    _chal_comps = g.chal_comps.copy() # Keep permanent completions
-    _chal_sd_boost = g.chal_sd_boost
-    _chal_perm_clk_boost = g.chal_perm_clk_boost
-    _chal_upg_cost_scale_mult = g.chal_upg_cost_scale_mult
-    # Add other permanent challenge rewards here if needed
+    # Perform reset
+    if reset_type == 'purify': reset_for_purify(True)
+    elif reset_type in ['crystalline', 'cryst']: reset_for_crystalline(True)
+    elif reset_type in ['ascension', 'asc']: reset_for_ascension(True)
+    else: reset_for_ascension(True) # Default
 
-    # Perform the requested reset level
-    if reset_type == 'purify':
-        reset_for_purify(keep_challenge_progress=True) # Keep playtime etc. for chal check
-    elif reset_type == 'crystalline':
-        reset_for_crystalline(keep_challenge_progress=True)
-    elif reset_type == 'ascension':
-        reset_for_ascension(keep_challenge_progress=True)
-    else: # Default to ascension reset if invalid type specified
-        logging.warning(f"Unknown reset level '{reset_type}' for challenge, defaulting to ascension.")
-        reset_for_ascension(keep_challenge_progress=True)
+    # Restore state
+    g.celest_cnt, g.nebula_fragments, g.celest_cst, g.celest_unl = _celest_cnt, _neb_frag, _celest_cst, _celest_unl
+    if reset_type in ['purify', 'crystalline', 'cryst', 'ascension', 'asc']:
+        g.asc_lvl, g.asc_xp, g.asc_first, g.sd, g.asc_cnt = _lvl, _xp, _first, _sd, _asc_cnt
+        g.relic_lvls, g.chal_comps = _rl, _cc
+        g.chal_sd_bst, g.chal_perm_clk_bst, g.chal_upg_cst_scale_mult = _sb, _cb, _cm
 
-    # Restore persistent state
-    g.asc_lvl = _asc_lvl
-    g.asc_xp = _asc_xp
-    g.asc_first = _asc_first
-    g.relic_lvls = _relic_lvls
-    g.chal_comps = _chal_comps
-    g.chal_sd_boost = _chal_sd_boost
-    g.chal_perm_clk_boost = _chal_perm_clk_boost
-    g.chal_upg_cost_scale_mult = _chal_upg_cost_scale_mult
-    # Restore other permanent rewards if added
-
-    # Set the active challenge and reset playtime for this challenge run
-    g.active_chal = challenge_id
-    g.playtime = 0.0 # Start timer for this challenge attempt
-
-    # Recalculate values with challenge effects potentially applied
+    g.active_chal, g.playtime = cid, 0.0
     recalculate_derived_values()
-    logging.info(f"Challenge '{challenge_id}' started.")
+    logging.info(f"Challenge '{cid}' started.")
 
-# --- Action Functions (Purify, Crystalline, Ascend) ---
+# --- Action Functions ---
 def purify():
-    global points, g # Use 'g'
-    # Check challenge restrictions
-    if g.active_chal == 'c6':
-        logging.warning("Cannot Purify while in Challenge C6.")
-        return
-
-    # Recalculate max purify based on current state *before* checking
-    recalculate_derived_values() # Ensures g.pur_max is up-to-date
-    current_max = g.pur_max
-
-    can_purify, reason = False, "Max Reached"
-    next_p_num = g.pur_cnt + 1
-    if g.pur_cnt < current_max:
-        if next_p_num <= 10: can_purify=True
-        elif next_p_num <= 15:
-            can_purify=g.upg5_comp
-            reason="Requires Upg5"
-        else: # P16+
-            can_purify=g.cr5_comp
-            reason="Requires C5"
-
-    if not can_purify:
-        logging.warning(f"Cannot Purify: {reason}")
-        return
-
-    cost = g.pur_cost / g.p24_pur_cost_div # Apply P24 divisor
-    if points < cost:
-        logging.warning(f"Need {format_number(cost)} points for Purify {next_p_num}.")
-        return
-
-    # Apply effects *before* incrementing count
+    global pts, g
+    recalculate_derived_values()
+    cur_max = g.pur_max; can, reason = False, "Max Level"
+    next_p = g.pur_cnt + 1
+    if g.pur_cnt < cur_max:
+        if next_p <= 10: can=True
+        elif next_p <= 15: can=g.upg5_comp; reason="Req Upg5"
+        else: can=g.cr5_comp; reason="Req C5"
+    if not can: return
+    cst = g.pur_cst / g.p24_pur_cst_div
+    if pts < cst: return
     apply_purification_effects(g.pur_cnt)
-    prev_times = g.pur_cnt
-    g.pur_cnt += 1
-    # Don't subtract points if points are infinite (avoids NaN issues)
-    if not ma.isinf(points):
-        points = max(0, points - cost) # Prevent negative points
-    reset_for_purify(keep_challenge_progress=(g.active_chal is not None)) # Keep playtime if in challenge
-    # Calculate next cost based on previous count
-    try:
-        g.pur_cost = round(g.pur_cost * (3.0 + prev_times), 2)
-    except OverflowError:
-        g.pur_cost = float('inf')
-    logging.info(f"Purified! Times: {g.pur_cnt}/{int(current_max)}. Next Base Cost: {format_number(g.pur_cost)}")
+    prev_pur_cnt = g.pur_cnt; g.pur_cnt += 1
+    if not ma.isinf(pts): pts = max(0, pts - cst)
+    reset_for_purify(g.active_chal is not None)
+    try: g.pur_cst = round(g.pur_cst * (3.0 + prev_pur_cnt), 2)
+    except OverflowError: g.pur_cst = float('inf')
+    logging.info(f"Purified! {g.pur_cnt}/{int(cur_max)}. NextCost: {format_number(g.pur_cst / g.p24_pur_cst_div)}")
     recalculate_derived_values()
 
 def crystalline():
-    global points, g # Use 'g'
-    # Check challenge restrictions
-    # if g.active_chal == 'some_chal_blocking_cryst': return
-
-    if not g.cryst_unl:
-        logging.warning("Crystalline locked (Requires P10).")
-        return
-
-    # Recalculate max based on current P count *before* check
-    recalculate_derived_values() # Ensures g.cryst_max is correct
-    eff_max = g.cryst_max
-
-    next_c_num = g.cryst_cnt + 1
-    if g.cryst_cnt >= eff_max:
-        logging.warning(f"Max Crystallines reached ({int(eff_max)}).")
-        return
-    if g.cryst_cnt == 4 and g.pur_cnt < 15: # Check specific C5 requirement
-        logging.warning("Need P15 to perform Crystalline 5.")
-        return
-
-    cost = g.cryst_cost
-    if points < cost:
-        logging.warning(f"Need {format_number(cost)} points for Crystalline {next_c_num}.")
-        return
-
-    # Apply effect for the level being achieved
-    apply_crystalline_effects(next_c_num)
-    g.cryst_cnt += 1
-    # Don't subtract points if points are infinite
-    if not ma.isinf(points):
-        points = max(0, points - cost)
-    reset_for_crystalline(keep_challenge_progress=(g.active_chal is not None)) # Keep playtime if in challenge
-    # Define Crystalline costs
-    costs = {0: 2.5e8, 1: 1e12, 2: 1e15, 3: 1e18, 4: 1e21} # Costs for C1 to C5
-    g.cryst_cost = costs.get(g.cryst_cnt, float('inf')) # Get cost for *next* Crystalline
-    logging.info(f"Crystallized! Times: {g.cryst_cnt}/{int(eff_max)}. Next cost: {format_number(g.cryst_cost)}")
+    global pts, g
+    if not g.cryst_unl: return
+    recalculate_derived_values(); eff_max = g.cryst_max
+    next_c = g.cryst_cnt + 1
+    if g.cryst_cnt >= eff_max or (next_c == 5 and g.pur_cnt < 15): return
+    cst = g.cryst_cst
+    if pts < cst: return
+    apply_crystalline_effects(next_c); g.cryst_cnt += 1
+    if not ma.isinf(pts): pts = max(0, pts - cst)
+    reset_for_crystalline(g.active_chal is not None)
+    costs = {0: 2.5e8, 1: 1e12, 2: 1e15, 3: 1e18, 4: 1e21}
+    g.cryst_cst = costs.get(g.cryst_cnt, float('inf'))
+    logging.info(f"Crystallized! {g.cryst_cnt}/{int(eff_max)}. NextCost: {format_number(g.cryst_cst)}")
     recalculate_derived_values()
 
 def ascend():
-    global points, g # Use 'g'
-    if not g.asc_unl:
-        logging.warning("Ascension locked (Requires C5).")
-        return
-    # Cannot ascend while in a challenge
-    if g.active_chal:
-         logging.warning(f"Cannot Ascend while in Challenge '{g.active_chal}'. Exit first.")
-         return
-
-    cost = g.asc_cost
-    if points < cost:
-        logging.warning(f"Need {format_number(cost)} points to Ascend.")
-        return
-
-    # Calculate Stardust Gain
+    global pts, g
+    if not g.asc_unl or g.active_chal or pts < g.asc_cst: return
     sd_gain = 0
-    relic_sd_boost = get_relic_effect('relic_sd_gain', 1.0)
-    p22_boost = 1.1 if g.pur_cnt >= 22 else 1.0 # Apply P22 boost
-
     try:
-        if points >= cost and not ma.isinf(points) and points > 0:
-            # Logarithmic scaling based on points over cost, sqrt of crystalline count
-            log_arg = max(1, points / max(1, cost)) # Prevent division by zero if cost is 0 somehow
-            # Base gain + scaling factors
-            sd_gain = ma.floor(
-                (1 + 0.5 * ma.log10(log_arg)) # Base 1 + log scaling
-                * ma.sqrt(g.cryst_cnt + 1) # Boost from crystalline count
-                * g.chal_sd_boost # Boost from C1 reward
-                * relic_sd_boost # Boost from Relic
-                * p22_boost # Boost from P22
-            )
-            sd_gain = max(1, sd_gain) # Ensure at least 1 SD gain if cost is met
-    except (ValueError, OverflowError) as e:
-         logging.warning(f"Stardust gain calculation error: {e}")
-         sd_gain = 0 # Default to 0 on error
-
-    if sd_gain <= 0:
-        logging.warning("Cannot ascend for 0 Stardust (requires more points).")
-        return
-
-    # Calculate Ascension XP Gain (Task 2)
+        if pts >= g.asc_cst and ma.isfinite(pts) and pts > 0:
+            log_ratio = ma.log10(max(1, pts / max(1, g.asc_cst))); base_sd = 1 + 0.5 * log_ratio
+            cryst_mult = ma.sqrt(g.cryst_cnt + 1)
+            relic_bst = get_relic_effect('relic_sd_gain') # NF incl
+            chal_bst = g.chal_sd_bst; p22_bst = 1.1 if g.pur_cnt >= 22 else 1.0
+            nf_bst = g.get_nf_stardust_boost()
+            all_boosts = cryst_mult * relic_bst * chal_bst * p22_bst * nf_bst
+            if ma.isinf(all_boosts) or ma.isinf(base_sd): sd_gain = float('inf')
+            else: sd_gain = ma.floor(base_sd * all_boosts); sd_gain = max(1, sd_gain)
+    except (ValueError, OverflowError, TypeError) as e: sd_gain = 0; logging.error(f"SD Gain Calc Err: {e}")
+    if sd_gain <= 0 and not ma.isinf(sd_gain): return
     xp_gain = 0.0
     try:
-         if points >= cost and not ma.isinf(points) and points > 0:
-            base_xp = 100 # Minimum XP for ascending
-            # Scaled XP - adjust formula as needed for balance
-            scaled_xp = 50 * ma.log10(max(1, points / 1e40)) # Scale based on log of points (adjust divisor 1e40)
-            # Bonus XP based on Stardust gained
-            sd_xp_bonus = sd_gain * 10 # e.g., 10 XP per stardust
-            xp_gain = base_xp + scaled_xp + sd_xp_bonus
-            xp_gain = max(0, xp_gain) # Ensure non-negative XP
-    except (ValueError, OverflowError) as e:
-        logging.warning(f"Ascension XP gain calculation error: {e}")
-        xp_gain = 0.0
-
-    logging.info(f"Ascending! Gaining {format_number(sd_gain)} Stardust and {format_number(xp_gain)} Ascension XP.")
-    g.sd += sd_gain
-    g.asc_xp += xp_gain # Add XP
+        if pts >= g.asc_cst and ma.isfinite(pts) and pts > 0:
+             base_xp = 100.0; point_scale_xp = 0.0
+             if pts > 1e40: point_scale_xp = 50 * ma.log10(max(1, pts / 1e40))
+             sd_bonus_xp = float('inf') if ma.isinf(sd_gain) else (sd_gain * 10.0 if sd_gain > 0 else 0.0)
+             if ma.isinf(sd_bonus_xp) or ma.isinf(point_scale_xp): xp_gain = float('inf')
+             else: xp_gain = max(0.0, base_xp + point_scale_xp + sd_bonus_xp)
+    except (ValueError, OverflowError, TypeError) as e: xp_gain = 0.0; logging.error(f"XP Gain Calc Err: {e}")
+    logging.info(f"Ascending! Gain: {format_number(sd_gain)} SD, {format_number(xp_gain)} XP.")
+    if ma.isinf(g.sd) or ma.isinf(sd_gain): g.sd = float('inf')
+    elif ma.isfinite(g.sd) and ma.isfinite(sd_gain): g.sd += sd_gain
+    if ma.isinf(g.asc_xp) or ma.isinf(xp_gain): g.asc_xp = float('inf')
+    elif ma.isfinite(g.asc_xp) and ma.isfinite(xp_gain): g.asc_xp += xp_gain
     g.asc_cnt += 1
-
-    # Set flag for first ascension (Task 3)
-    if not g.asc_first:
-        g.asc_first = True
-        logging.info("First Ascension Complete! Challenge text revealed.")
-
-    # Perform reset (will reset playtime)
-    reset_for_ascension(keep_challenge_progress=False) # Full reset, exit any challenge state implicitly
-
-    # Check for level up AFTER resetting and adding XP
+    if not g.asc_first: g.asc_first=True; logging.info("First Ascension! Relics and Challenges unlocked.")
+    reset_for_ascension()
     g.check_ascension_level_up()
-
-    # Recalculate values after reset and potential level up
     recalculate_derived_values()
 
+def celestiality():
+    global pts, g
+    if not g.celest_unl or g.active_chal: return
+    req_met = (int(g.asc_lvl) >= CELESTIALITY_REQ_ASC_LVL and
+               int(g.cryst_cnt) >= CELESTIALITY_REQ_CRYST and
+               int(g.pur_cnt) >= CELESTIALITY_REQ_PUR)
+    if not req_met or pts < g.celest_cst: return
+    logging.info(f"Performing Celestiality {g.celest_cnt + 1}...")
+    nf_gain = 0.0
+    try:
+        point_factor = ma.log10(max(1.0, pts / NEBULA_FRAG_BASE_REQ_PTS)) if ma.isfinite(pts) and pts > 0 else 0.0
+        sd_factor = ma.log10(max(1.0, g.sd / NEBULA_FRAG_BASE_REQ_SD)) if ma.isfinite(g.sd) and g.sd > 0 else 0.0
+        asc_factor = ma.sqrt(max(0, g.asc_lvl / NEBULA_FRAG_BASE_REQ_ASC)) if ma.isfinite(g.asc_lvl) and g.asc_lvl > 0 else 0.0
+        base_gain = max(0.0, point_factor) + max(0.0, sd_factor) + max(0.0, asc_factor)
+        nf_gain = ma.floor(base_gain * 1.0) # Adjust multiplier for balance
+        nf_gain = max(0.0, nf_gain)
+    except (ValueError, OverflowError, TypeError) as e: nf_gain = 0.0; logging.error(f"NF Gain Calc Err: {e}")
+    logging.info(f"Gaining {format_number(nf_gain)} Nebula Fragments.")
+    g.celest_cnt += 1
+    if ma.isinf(g.nebula_fragments) or ma.isinf(nf_gain): g.nebula_fragments = float('inf')
+    elif ma.isfinite(g.nebula_fragments) and ma.isfinite(nf_gain): g.nebula_fragments += nf_gain
+    if not ma.isinf(pts): pts = max(0, pts - g.celest_cst)
+    try: g.celest_cst *= 1000 # Increase cost by 1000x
+    except OverflowError: g.celest_cst = float('inf')
+    reset_for_celestiality() # Full reset
+    recalculate_derived_values()
+    logging.info(f"Celestiality complete! Reached {g.celest_cnt}. Total NF: {format_number(g.nebula_fragments)}. Next Cost: {format_number(g.celest_cst)}")
 
 # --- Clicking Action ---
 def click_power_action():
-    global clicks, g # Use 'g'
-    if not g.cr4_unl: return # Still need C4 for clicking
-
-    # Base click power modified by permanent challenge boosts, ascension, scaling, relics
-    relic_clk_mult = get_relic_effect('relic_clk_mult', 1.0)
-    asc_click_boost = g.get_asc_clk_boost()
-    # Use clk_pow, chal_perm_clk_boost, asc_click_boost, clk_pt_scale
-    base_click = g.clk_pow * g.chal_perm_clk_boost * asc_click_boost * g.clk_pt_scale * relic_clk_mult
-
-    # Apply crit chance/multiplier
-    final_click = base_click * (g.clk_crit_m if random.random() < g.clk_crit_c else 1.0)
-
+    global clks, g
+    if not g.cr4_unl: return
+    relic_m = get_relic_effect('relic_clk_mult') # NF included
+    asc_m = g.get_asc_clk_boost()
+    chal_perm_m = g.chal_perm_clk_bst
+    point_scale_m = g.clk_pt_scale
+    base_clk = float('inf')
+    if not any(ma.isinf(v) for v in [g.clk_pow, chal_perm_m, asc_m, point_scale_m, relic_m]):
+        try: base_clk = g.clk_pow * chal_perm_m * asc_m * point_scale_m * relic_m
+        except OverflowError: pass
+    crit_m = g.clk_crit_m if random.random() < g.clk_crit_c else 1.0
+    final_clk = float('inf')
+    if not (ma.isinf(base_clk) or ma.isinf(crit_m)):
+        try: final_clk = base_clk * crit_m
+        except OverflowError: pass
+    if g.asc_first and ma.isfinite(final_clk) and final_clk > 0:
+        try:
+            xp_gain = final_clk / 10.0
+            if ma.isinf(g.asc_xp) or ma.isinf(xp_gain): g.asc_xp = float('inf')
+            elif ma.isfinite(g.asc_xp) and ma.isfinite(xp_gain): g.asc_xp += xp_gain
+            g.check_ascension_level_up(from_click=True)
+        except OverflowError: g.asc_xp = float('inf'); logging.warning("Overflow calculating click XP gain.")
+        except Exception as e: logging.error(f"Error calculating click XP: {e}")
     try:
-        clicks = min(float('inf'), clicks + final_click)
-    except OverflowError:
-        clicks = float('inf')
-
+        current_clks = clks if ma.isfinite(clks) else 0.0
+        if ma.isinf(current_clks) or ma.isinf(final_clk): clks = float('inf')
+        else: clks = min(float('inf'), current_clks + final_clk)
+    except OverflowError: clks = float('inf')
 
 # --- Autobuyer Logic ---
+def buy_upgrade_max(upg_func, cost_attr, level_attr, max_attr):
+    global pts
+    bought_count = 0
+    for _ in range(MAX_BUY_ITERATIONS):
+        try:
+             lvl = int(getattr(g, level_attr, 0))
+             max_lvl_raw = getattr(g, max_attr, 0)
+             max_lvl = float('inf') if ma.isinf(max_lvl_raw) else int(max_lvl_raw)
+        except ValueError: break
+        if lvl >= max_lvl: break
+        cost = getattr(g, cost_attr, float('inf'))
+        if pts < cost or ma.isinf(cost): break
+        state_before = { 'pts': pts, 'lvl': lvl, 'cost': cost }
+        upg_func()
+        state_after = { 'pts': pts, 'lvl': getattr(g, level_attr, 0), 'cost': getattr(g, cost_attr, float('inf')) }
+        if state_after['lvl'] > state_before['lvl'] or \
+           state_after['cost'] != state_before['cost'] or \
+           state_after['pts'] < state_before['pts']:
+            bought_count += 1
+        else: break
+
 def autobuy_tick():
-    global g # Use 'g'
+    global g
     try:
-        # C3 autobuys Upg 1-3
+        max_buy_active = g.p20_lim_brk
         if g.cr3_unl:
-            # Add small random delay to spread out purchases slightly
-            if random.random() < 0.8: upgrade1()
-            if random.random() < 0.6: upgrade2()
-            if random.random() < 0.4: upgrade3()
-        # P12 autobuys Upg 4
+            if max_buy_active:
+                buy_upgrade_max(upgrade1, 'upg1_cst', 'upg1_lvl', 'upg1_max')
+                buy_upgrade_max(upgrade2, 'upg2_cst', 'upg2_lvl', 'upg2_max')
+                buy_upgrade_max(upgrade3, 'upg3_cst', 'upg3_lvl', 'upg3_max')
+            else:
+                if random.random() < 0.8: upgrade1()
+                if random.random() < 0.6: upgrade2()
+                if random.random() < 0.4: upgrade3()
         if g.p12_auto_u4:
-            if random.random() < 0.5: upgrade4()
-        # P21 might make this faster or more efficient (e.g., buy max) - requires more logic
+            if max_buy_active:
+                buy_upgrade_max(upgrade4, 'upg4_cst', 'upg4_lvl', 'upg4_max')
+            else:
+                if random.random() < 0.5: upgrade4()
     except Exception as e: logging.error(f"Error in autobuy_tick: {e}", exc_info=True)
 
 def autobuy_thread_func():
     logging.info("Autobuyer started.")
     base_sleep = 0.1
-    p21_speed_factor = 0.5 if g.pur_cnt >= 21 else 1.0 # Example P21 effect
     while is_running:
-        sleep_time = base_sleep * p21_speed_factor
-        if g.cr3_unl or g.p12_auto_u4:
-             autobuy_tick()
-        time.sleep(sleep_time)
+        p21_speed_f = 0.5 if g.pur_cnt >= 21 else 1.0
+        sleep_t = base_sleep * p21_speed_f
+        if g.cr3_unl or g.p12_auto_u4: autobuy_tick()
+        time.sleep(sleep_t)
     logging.info("Autobuyer finished.")
 
 def start_autobuy_thread_if_needed():
-    global autobuy_thread, g # Use 'g'
+    global autobuy_thd, g
     if g.cr3_unl or g.p12_auto_u4:
-        if not autobuy_thread or not autobuy_thread.is_alive():
+        if not autobuy_thd or not autobuy_thd.is_alive():
             logging.info("Starting autobuy thread.")
-            autobuy_thread = th.Thread(target=autobuy_thread_func, daemon=True)
-            autobuy_thread.start()
+            autobuy_thd = th.Thread(target=autobuy_thread_func, daemon=True)
+            autobuy_thd.start()
 
 # --- Relic Buying Function ---
-def buy_relic(relic_id):
-    global g # Use 'g'
-    if relic_id not in RELICS_DATA:
-        logging.warning(f"Unknown relic: {relic_id}")
-        return
+def buy_relic(rid):
+    global g; data = RELICS_DATA.get(rid)
+    if not data: return
+    lvl = g.relic_lvls.get(rid, 0); max_lvl = data.get('max_level', RELIC_MAX_LEVEL)
+    try: lvl_int = int(lvl); max_lvl_int = int(max_lvl) if max_lvl is not None else float('inf')
+    except ValueError: return
+    if lvl_int >= max_lvl_int: return
+    try: cst = round(data['cost_base'] * (data['cost_scale'] ** lvl_int))
+    except OverflowError: cst = float('inf')
+    if ma.isinf(cst): return
+    p23_reduc = 0.95 if g.pur_cnt >= 23 else 1.0
+    final_cst = round(cst * p23_reduc) if ma.isfinite(cst) else float('inf')
+    can_afford = False
+    if ma.isinf(g.sd) and ma.isfinite(final_cst): can_afford = True; final_cst = 0
+    elif ma.isfinite(g.sd) and ma.isfinite(final_cst) and g.sd >= final_cst: can_afford = True
+    if can_afford:
+        if ma.isfinite(g.sd): g.sd -= final_cst
+        g.relic_lvls[rid] = lvl_int + 1
+        logging.info(f"Bought Relic '{data['name']}' (Lvl {lvl_int+1}) for {format_number(final_cst)} SD.")
+        recalculate_derived_values()
 
-    data = RELICS_DATA[relic_id]
-    lvl = g.relic_lvls.get(relic_id, 0)
-    # Use constant RELIC_MAX_LEVEL (Task 1)
-    max_lvl = data.get('max_level', RELIC_MAX_LEVEL) # Fallback to global max if specific not set
-
-    if max_lvl is not None and lvl >= max_lvl:
-        logging.info(f"Relic '{data['name']}' is at max level ({max_lvl}).")
-        return
-
-    # Calculate cost
-    try:
-        cost = round(data['cost_base'] * (data['cost_scale'] ** lvl))
-    except OverflowError:
-        cost = float('inf') # Cost is infinite if scaling overflows
-
-    if ma.isinf(cost):
-         logging.warning(f"Cannot afford Relic '{data['name']}' (Lvl {lvl+1}) - Cost overflowed.")
-         return
-
-
-    # Apply P23 cost reduction
-    p23_reduction = 0.95 if g.pur_cnt >= 23 else 1.0
-    final_cost = round(cost * p23_reduction)
-
-    if g.sd >= final_cost:
-        g.sd -= final_cost
-        g.relic_lvls[relic_id] = lvl + 1
-        logging.info(f"Bought Relic '{data['name']}' (Lvl {lvl + 1}) for {format_number(final_cost)} Stardust.")
-        recalculate_derived_values() # Recalculate stats after buying relic
-    else:
-        needed = final_cost - g.sd
-        logging.warning(f"Need {format_number(needed)} more Stardust for '{data['name']}' (Lvl {lvl+1}). Cost: {format_number(final_cost)}")
-
-
-# --- Challenge Management Functions (Task 6) ---
-
-challenge_buttons = {} # To store Enter/Exit buttons for UI update
-
-def enter_challenge(challenge_id):
-    """Initiates entering a challenge after confirmation."""
+# --- Challenge Management Functions ---
+chal_btns = {}
+def enter_challenge(cid):
     global g
-    if g.active_chal:
-        messagebox.showwarning("Challenge Active", f"You are already in Challenge '{g.active_chal}'.\nExit the current challenge first.")
-        return
-    if not g.asc_first:
-         messagebox.showwarning("Locked", "Challenges are locked until you Ascend for the first time.")
-         return
-
-    chal_data = CHALLENGES.get(challenge_id)
-    if not chal_data:
-        logging.error(f"Invalid challenge ID for enter: {challenge_id}")
-        return
-
-    # Check max completions
-    current_completions = g.chal_comps.get(challenge_id, 0)
-    max_completions = chal_data.get('max_completions')
-    if max_completions is not None and current_completions >= max_completions:
-        messagebox.showinfo("Maxed Out", f"You have already maxed out completions for Challenge '{challenge_id}' ({int(max_completions)}).")
-        return
-
-    # Confirmation dialog
-    reset_level = chal_data.get('reset_level', 'ascension').capitalize()
-    restrictions = chal_data.get('restrictions_desc', 'Standard rules apply.')
-    msg = (f"Enter Challenge: {chal_data['desc_base']}?\n\n"
-           f"This will perform a full **{reset_level} Reset** (keeping Ascension/Relics/Completions).\n\n"
-           f"Restrictions: {restrictions}\n\n"
-           f"Are you sure?")
-    confirmed = messagebox.askyesno("Enter Challenge Confirmation", msg)
-
-    if confirmed:
-        reset_for_challenge(challenge_id)
-        # Update UI immediately after starting
-        updateui()
+    if g.active_chal or not g.asc_first: return
+    chal_data = CHALLENGES.get(cid)
+    if not chal_data: return
+    cur_comp = g.chal_comps.get(cid, 0); max_comp = chal_data.get('mc')
+    if max_comp is not None and cur_comp >= max_comp: return
+    reset_lvl = chal_data.get('rl', 'asc').capitalize(); restr = chal_data.get('restr', 'N/A')
+    msg = (f"Enter Challenge: {chal_data['db']}?\n\n"
+           f"Reset Type: **{reset_lvl}**\nRestrictions: {restr}\n\nAre you sure?")
+    if messagebox.askyesno("Enter Challenge?", msg):
+        reset_for_challenge(cid); updateui()
 
 def exit_challenge():
-    """Exits the current challenge."""
     global g
-    if not g.active_chal:
-        logging.info("Not currently in a challenge.")
-        return
+    if not g.active_chal: return
+    exiting_chal = g.active_chal; g.active_chal = None
+    reset_for_ascension(False); recalculate_derived_values()
+    logging.info(f"Exited challenge {exiting_chal}."); updateui()
 
-    exiting_chal_id = g.active_chal
-    logging.info(f"Exiting Challenge '{exiting_chal_id}' manually.")
-    g.active_chal = None
-    # Perform a standard ascension reset when exiting a challenge
-    # This ensures a clean state regardless of the challenge's internal reset level
-    reset_for_ascension(keep_challenge_progress=False) # Perform full reset, clear playtime
-    recalculate_derived_values()
-    logging.info("Exited challenge. Performed Ascension reset.")
-    # Update UI
-    updateui()
-
-def complete_challenge(challenge_id):
-    """Called when challenge requirements are met."""
+def complete_challenge(cid):
     global g
-    if g.active_chal != challenge_id:
-        logging.warning(f"Attempted to complete challenge {challenge_id}, but not active.")
-        return
-
-    chal_data = CHALLENGES.get(challenge_id)
-    if not chal_data:
-        logging.error(f"Invalid challenge ID for complete: {challenge_id}")
-        g.active_chal = None # Clear invalid state
-        recalculate_derived_values()
-        updateui()
-        return
-
-    # Check max completions again (safety)
-    current_completions = g.chal_comps.get(challenge_id, 0)
-    max_completions = chal_data.get('max_completions')
-    if max_completions is not None and current_completions >= max_completions:
-        logging.warning(f"Challenge {challenge_id} already maxed upon completion check.")
-        g.active_chal = None # Exit challenge state
-        recalculate_derived_values()
-        updateui()
-        return
-
-    logging.info(f"Challenge Completed: {chal_data['desc_base']} (Level {current_completions + 1})")
-
-    # Apply reward before incrementing count, so reward func sees correct 'current' level
+    if g.active_chal != cid: return
+    chal_data = CHALLENGES.get(cid)
+    if not chal_data: g.active_chal = None; recalculate_derived_values(); updateui(); return
+    cur_comp = g.chal_comps.get(cid, 0); max_comp = chal_data.get('mc')
+    if max_comp is not None and cur_comp >= max_comp:
+        g.active_chal = None; reset_for_ascension(False); recalculate_derived_values(); updateui(); return
+    new_comp_level = cur_comp + 1
+    logging.info(f"Challenge Completed: {chal_data['db']} (Level {new_comp_level})")
     try:
-        # Pass the *next* completion level to the reward function if needed
-        apply_func = chal_data.get('apply_reward_func')
-        if apply_func:
-            apply_func(g) # Apply the reward
-            g.chal_comps[challenge_id] = current_completions + 1 # Increment permanent completion count *after* applying reward
-            logging.info(f"Applied reward for {challenge_id}. Total completions: {g.chal_comps[challenge_id]}")
-        else:
-             g.chal_comps[challenge_id] = current_completions + 1 # Increment even if no reward func
-             logging.info(f"Incremented completions for {challenge_id} (no specific reward func). Total: {g.chal_comps[challenge_id]}")
-
-    except Exception as e:
-        logging.error(f"Error applying reward for challenge {challenge_id}: {e}", exc_info=True)
-        # Don't increment completions if reward failed? Decide policy.
-        # For now, we log the error but still increment completions and reset.
-
-    # Exit the challenge state and perform reset
-    g.active_chal = None
-    reset_for_ascension(keep_challenge_progress=False) # Full reset after completion
-    recalculate_derived_values() # Recalculate with new reward potentially active
-    # Show completion message *after* reset and recalc
-    messagebox.showinfo("Challenge Complete!", f"You successfully completed:\n{chal_data['desc_base']} (Level {g.chal_comps.get(challenge_id, '??')})")
-    updateui() # Update UI to reflect challenge completion and reset
-
+        apply_func = chal_data.get('arf');
+        if apply_func: apply_func(g)
+        g.chal_comps[cid] = new_comp_level
+        logging.info(f"Applied reward & incremented {cid} completions -> {g.chal_comps[cid]}")
+    except Exception as e: logging.error(f"Reward/Increment error for {cid}: {e}", exc_info=True)
+    g.active_chal = None; reset_for_ascension(False); recalculate_derived_values()
+    messagebox.showinfo("Challenge Complete!", f"Completed:\n{chal_data['db']} (Level {new_comp_level})"); updateui()
 
 def check_challenge_completion():
-    """Checks if the *currently active* challenge's completion criteria are met."""
     global g
-    if not g.active_chal:
-        return # Not in a challenge
-
-    chal_id = g.active_chal
-    chal_data = CHALLENGES.get(chal_id)
-    if not chal_data:
-        logging.error(f"Active challenge '{chal_id}' not found in definitions.")
-        g.active_chal = None # Clear invalid state
-        return
-
-    # Check if already maxed (shouldn't happen if entry logic is correct, but safety check)
-    lvl = g.chal_comps.get(chal_id, 0)
-    max_lvl = chal_data.get('max_completions')
-    if max_lvl is not None and lvl >= max_lvl:
-        # This case should ideally be handled by enter_challenge preventing entry
-        logging.warning(f"Max completions reached for active challenge {chal_id} during check.")
-        # Force exit if somehow entered maxed challenge
-        exit_challenge()
-        return
-
+    if not g.active_chal: return
+    cid = g.active_chal; chal_data = CHALLENGES.get(cid)
+    if not chal_data: exit_challenge(); return
+    lvl = g.chal_comps.get(cid, 0); max_lvl = chal_data.get('mc')
+    if max_lvl is not None and lvl >= max_lvl: exit_challenge(); return
     try:
-        req = chal_data['requirement_func'](g, lvl)
-        if chal_data['check_func'](g, req):
-            # Completion criteria met!
-            complete_challenge(chal_id)
-    except Exception as e:
-        logging.error(f"Error checking completion for challenge {chal_id}: {e}", exc_info=True)
-        # Optionally exit challenge on error? Or just log? Logging for now.
+        req_func = chal_data['rf']; comp_func = chal_data['cf']
+        requirement = req_func(g, lvl)
+        if comp_func(g, requirement): complete_challenge(cid)
+    except Exception as e: logging.error(f"Completion check error {cid}: {e}", exc_info=True)
 
-
-# --- Save/Load (Updated for new state variables) ---
+# --- Save/Load ---
 def save_game():
-    global points, clicks, g # Use 'g'
-    logging.info("Saving game...")
+    global pts, clks, g; logging.info("Saving...")
     try:
-        # Dynamically get attributes from GameState instance 'g'
-        save_data = {k: getattr(g, k) for k in g.__dict__ if not k.startswith('_')}
-
-        # Add global variables explicitly
-        save_data.update({
-            "version": SAVE_VERSION,
-            "points": points,
-            "clicks": clicks,
-            "last_save_time": time.time() # Update last save time here
-        })
-        g.last_save_time = save_data["last_save_time"] # Update in-memory state too
-
-        # Convert potentially problematic types (like Inf) to strings for JSON
+        s_data = {k: getattr(g, k) for k in g.__dict__ if not k.startswith('_')}
+        s_data.update({"v": SAVE_VERSION, "p": pts, "c": clks, "nf": g.nebula_fragments, "lst": time.time()})
+        g.last_save_time = s_data["lst"]
         def convert_inf_nan(o):
             if isinstance(o, float):
-                if ma.isinf(o):
-                    return "__Infinity__" if o > 0 else "__-Infinity__"
-                elif ma.isnan(o):
-                    return "__NaN__"
-            return o # Keep other types as is
-
-        # Use default=convert_inf_nan to handle special float values
-        json_string = json.dumps(save_data, separators=(',', ':'), default=convert_inf_nan)
-        encoded_bytes = base64.b64encode(json_string.encode('utf-8'))
-        encoded_string = encoded_bytes.decode('utf-8')
-        with open(SAVE_FILE, "w", encoding='utf-8') as f: f.write(encoded_string) # Specify encoding
-        logging.info(f"Game saved to {SAVE_FILE}")
+                if ma.isinf(o): return "__Infinity__" if o > 0 else "__-Infinity__"
+                elif ma.isnan(o): return "__NaN__"
+            return o
+        json_string = json.dumps(s_data, separators=(',', ':'), default=convert_inf_nan)
+        encoded_string = base64.b64encode(json_string.encode('utf-8')).decode('utf-8')
+        with open(SAVE_FILE, "w", encoding='utf-8') as f: f.write(encoded_string)
+    except TypeError as e:
+        logging.error(f"Save failed - Type Error: {e}. Data:", exc_info=True)
+        for k, v in s_data.items():
+            try: json.dumps({k: v}, default=convert_inf_nan)
+            except TypeError: logging.error(f"Unserializable type in key '{k}': {type(v)}")
     except Exception as e: logging.error(f"Save failed: {e}", exc_info=True)
 
 def autosave_thread_func():
     logging.info("Autosave started.")
     while is_running:
         time.sleep(AUTOSAVE_INTERVAL_S)
-        if is_running: # Check again before saving, in case of fast shutdown
-            save_game()
+        if is_running: save_game()
     logging.info("Autosave finished.")
 
 def load_game():
-    global points, clicks, g, is_running # Use 'g'
+    global pts, clks, g, is_running
     if not os.path.exists(SAVE_FILE):
-        logging.info("No save file found. Starting new game.")
-        g = GameState() # Initialize new state
-        points = 0.0
-        clicks = 0.0
-        recalculate_derived_values()
-        return
+        logging.info("No save file found. Starting new game.");
+        g=GameState(); pts,clks=0.0,0.0; recalculate_derived_values(); return
     logging.info(f"Loading game from {SAVE_FILE}...")
     try:
-        with open(SAVE_FILE, "r", encoding='utf-8') as f: encoded_string = f.read() # Specify encoding
-        decoded_bytes = base64.b64decode(encoded_string.encode('utf-8'))
-        json_string = decoded_bytes.decode('utf-8')
-
-        # Hook to convert special string values back to float representations
+        with open(SAVE_FILE, "r", encoding='utf-8') as f: encoded_string = f.read()
+        json_string = base64.b64decode(encoded_string.encode('utf-8')).decode('utf-8')
         def decode_inf_nan(dct):
             for k, v in dct.items():
                 if isinstance(v, str):
-                    if v == "__Infinity__":
-                        dct[k] = float('inf')
-                    elif v == "__-Infinity__":
-                        dct[k] = float('-inf')
-                    elif v == "__NaN__":
-                        dct[k] = float('nan')
+                    if v == "__Infinity__": dct[k] = float('inf')
+                    elif v == "__-Infinity__": dct[k] = float('-inf')
+                    elif v == "__NaN__": dct[k] = float('nan')
             return dct
-
-        # Load JSON with the object_hook to handle Inf/NaN strings
         loaded_data = json.loads(json_string, object_hook=decode_inf_nan)
 
-        loaded_version = loaded_data.get("version", 0)
+        loaded_version = loaded_data.get("v", 0)
         if loaded_version != SAVE_VERSION:
-            logging.warning(f"Save version mismatch (Save: {loaded_version}, Game: {SAVE_VERSION}). Starting new game to prevent errors.")
-            # Optional: Implement migration logic here if feasible/desired
-            g = GameState()
-            points = 0.0
-            clicks = 0.0
-            recalculate_derived_values()
-            save_game() # Save the new state immediately
-            return
+            logging.warning(f"Save version mismatch ({loaded_version} vs {SAVE_VERSION}). New game.")
+            # backup?
+            g=GameState(); pts,clks=0.0,0.0; recalculate_derived_values(); save_game(); return
 
-        # Create a default state to get expected types and default values
+        pts = loaded_data.get("p", 0.0); clks = loaded_data.get("c", 0.0)
+        g.nebula_fragments = loaded_data.get("nf", 0.0)
+        if not isinstance(pts,(int,float)) or ma.isnan(pts) or (ma.isinf(pts) and pts < 0): pts=0.0
+        if not isinstance(clks,(int,float)) or ma.isnan(clks) or (ma.isinf(clks) and clks < 0): clks=0.0
+        if not isinstance(g.nebula_fragments,(int,float)) or ma.isnan(g.nebula_fragments) or (ma.isinf(g.nebula_fragments) and g.nebula_fragments < 0): g.nebula_fragments=0.0
+
         default_g = GameState()
-
-        # Load global vars first
-        points = loaded_data.get("points", 0.0)
-        clicks = loaded_data.get("clicks", 0.0)
-        # Ensure types are correct (JSON loads numbers as float/int, hook handles Inf/NaN)
-        if not isinstance(points, (int, float)): points = 0.0
-        if not isinstance(clicks, (int, float)): clicks = 0.0
-
-        # Load GameState attributes
         for key, default_value in default_g.__dict__.items():
-            if key.startswith('_'): continue # Skip private attributes
-            loaded_value = loaded_data.get(key) # Get value from loaded data dict
+            if key.startswith('_') or key == 'nebula_fragments': continue
+            loaded_value = loaded_data.get(key)
             expected_type = type(default_value)
-
-            # Type checking and conversion (handle potential None from missing keys)
-            final_value = default_value # Start with default
+            final_value = default_value
             if loaded_value is not None:
-                # Attempt conversion or assignment if type matches or is compatible
                 try:
-                    if expected_type == float and isinstance(loaded_value, (int, float)):
-                        final_value = float(loaded_value)
-                    elif expected_type == int and isinstance(loaded_value, (int, float)) and ma.isfinite(loaded_value): # Ensure finite for int conversion
-                        final_value = int(loaded_value)
-                    elif expected_type == bool: # Handle bool explicitly
-                        final_value = bool(loaded_value)
-                    elif expected_type == dict and isinstance(loaded_value, dict):
-                         final_value = loaded_value # Assume dict structure is okay if type matches
-                    elif expected_type == str and isinstance(loaded_value, str):
-                         final_value = loaded_value
-                    # Add list, set etc. if needed here
-                    # Fallback check if types already match
-                    elif isinstance(loaded_value, expected_type):
-                        final_value = loaded_value
-                    else:
-                         # Log type mismatch if conversion wasn't handled above
-                         logging.warning(f"Load type mismatch for '{key}' (Expected {expected_type.__name__}, Got {type(loaded_value).__name__}). Using default.")
-                         final_value = default_value # Revert to default
-                except Exception as type_e:
-                    logging.warning(f"Load error converting '{key}' (Value: {loaded_value}): {type_e}. Using default.")
-                    final_value = default_value # Revert to default on conversion error
-            else:
-                # Key was missing in save file, use default value
-                final_value = default_value
-
-            # Set the attribute on the actual game state 'g'
+                    if expected_type is float:
+                         if isinstance(loaded_value, (int, float)): final_value = float(loaded_value)
+                         else: raise TypeError("Expected float")
+                    elif expected_type is int:
+                         if isinstance(loaded_value, (int, float)) and ma.isfinite(loaded_value): final_value = int(loaded_value)
+                         else: raise TypeError("Expected finite int/float")
+                    elif expected_type is bool: final_value = bool(loaded_value)
+                    elif expected_type is dict:
+                         if isinstance(loaded_value, dict):
+                             if key in ['relic_lvls', 'chal_comps']: final_value = {str(k): v for k, v in loaded_value.items()}
+                             else: final_value = loaded_value
+                         else: raise TypeError("Expected dict")
+                    elif expected_type is str:
+                         if isinstance(loaded_value, str): final_value = loaded_value
+                         else: raise TypeError("Expected str")
+                    elif isinstance(loaded_value, expected_type): final_value = loaded_value
+                    else: logging.warning(f"Load type mismatch '{key}'. Exp {expected_type.__name__}, got {type(loaded_value).__name__}. Using default."); final_value = default_value
+                    if isinstance(final_value, (int, float)):
+                        if ma.isnan(final_value): final_value = default_value
+                        elif ma.isinf(final_value) and final_value < 0 and not (isinstance(default_value, float) and ma.isinf(default_value)): final_value = default_value
+                except (TypeError, ValueError, KeyError, AssertionError) as conv_e:
+                     logging.warning(f"Load conversion error '{key}' (Val: {loaded_value!r}): {conv_e}. Using default."); final_value = default_value
             setattr(g, key, final_value)
 
-
-        # Offline progress calculation
-        last_save = g.last_save_time if isinstance(g.last_save_time, (int, float)) else time.time()
-        time_offline = max(0, time.time() - last_save)
-
-        # Only calculate significant offline time, and not if in a challenge
-        # Also skip if core values are infinite
-        if time_offline > 5 and not g.active_chal and ma.isfinite(points) and ma.isfinite(clicks):
-            logging.info("Calculating offline progress...")
-            # Recalculate PPS/CPS *before* adding offline gains
+        last_save_time = loaded_data.get("lst", time.time()); g.last_save_time = last_save_time
+        offline_time_s = max(0, time.time() - last_save_time)
+        if offline_time_s > 5 and not g.active_chal and ma.isfinite(pts) and ma.isfinite(clks):
+            logging.info(f"Calculating offline progress for {offline_time_s:.1f} seconds...")
             recalculate_derived_values()
-            # Use lower offline rates (ensure calculated pps/cps are finite)
-            off_pps = pps * 0.5 if ma.isfinite(pps) else 0.0
-            off_pts = off_pps * time_offline
-            off_cps = g.auto_cps * 0.5 if ma.isfinite(g.auto_cps) else 0.0
-            off_clicks = off_cps * time_offline
+            offline_pps = pps * 0.5 if ma.isfinite(pps) else 0.0
+            offline_cps = g.auto_cps * 0.5 if ma.isfinite(g.auto_cps) else 0.0
+            offline_pts_gain = offline_pps * offline_time_s
+            offline_clks_gain = offline_cps * offline_time_s
+            try: pts = min(float('inf'), pts + offline_pts_gain)
+            except OverflowError: pts = float('inf')
+            try: clks = min(float('inf'), clks + offline_clks_gain)
+            except OverflowError: clks = float('inf')
+            logging.info(f"Offline Progress: Gained ~{format_number(offline_pts_gain)} P, ~{format_number(offline_clks_gain)} C.")
+        elif offline_time_s > 5: logging.info(f"Skipping offline progress (In chal/non-finite). Offline time: {offline_time_s:.1f}s")
 
-            # Add offline gains safely, checking for overflow
-            try:
-                points = min(float('inf'), points + off_pts)
-            except OverflowError: points = float('inf')
-            try:
-                clicks = min(float('inf'), clicks + off_clicks)
-            except OverflowError: clicks = float('inf')
-
-            logging.info(f"Offline: {time_offline:.1f}s. Gained approx ~{format_number(off_pts)} pts, ~{format_number(off_clicks)} clicks.")
-
-        # Ensure core values are not NaN after load/offline calc
-        if ma.isnan(points): points = 0.0
-        if ma.isnan(clicks): clicks = 0.0
-
-        g.last_save_time = time.time() # Update last save time after load/offline calc
-        logging.info("Save loaded successfully.")
-        recalculate_derived_values() # Final recalculation after load
-
-    except json.JSONDecodeError as e:
-        logging.error(f"Load failed: Invalid JSON data in save file. {e}", exc_info=True)
-        logging.info("Starting new game.")
-        g = GameState()
-        points = 0.0
-        clicks = 0.0
         recalculate_derived_values()
-        save_game()
-    except base64.binascii.Error as e:
-         logging.error(f"Load failed: Invalid Base64 data. {e}", exc_info=True)
-         logging.info("Starting new game.")
-         g = GameState()
-         points = 0.0
-         clicks = 0.0
-         recalculate_derived_values()
-         save_game()
-    except Exception as e:
-        logging.error(f"Load failed: {e}", exc_info=True)
-        logging.info("Starting new game due to load error.")
-        g = GameState()
-        points = 0.0
-        clicks = 0.0
-        recalculate_derived_values()
-        save_game()
+        g.check_celestiality_unlock()
+        g.last_save_time = time.time()
+        logging.info("Load successful.")
 
+    except FileNotFoundError: logging.error(f"Load fail: {SAVE_FILE} disappeared."); g=GameState(); pts,clks=0.0,0.0; recalculate_derived_values(); save_game()
+    except (json.JSONDecodeError, base64.binascii.Error) as decode_e: logging.error(f"Load fail: Corrupt save - {decode_e}. New game."); g=GameState(); pts,clks=0.0,0.0; recalculate_derived_values(); save_game()
+    except Exception as e: logging.error(f"Load failed: Unexpected error - {e}", exc_info=True); g=GameState(); pts,clks=0.0,0.0; recalculate_derived_values(); save_game()
 
-# --- UI Update Function (Major Changes Needed) ---
-# Declare UI elements globally (or pass them around)
-pointlabel=None
-ppslabel=None
-clicklabel=None
-stardustlabel=None
-asc_lvl_label=None # New label for Ascension Level
-asc_prog_label=None # New label for Ascension Progress
-upgrade1costlabel=None
-upgrade1explainlabel=None
-button1=None
-upgrade2costlabel=None
-upgrade2explainlabel=None
-button2=None
-upgrade3costlabel=None
-upgrade3explainlabel=None
-button3=None
-upgrade4costlabel=None
-upgrade4explainlabel=None
-button4=None
-upgrade5costlabel=None
-upgrade5explainlabel=None
-button5=None
-upgrade6costlabel=None
-upgrade6explainlabel=None
-button6=None
-upgrade7costlabel=None
-upgrade7explainlabel=None
-button7=None
-upgrade8costlabel=None
-upgrade8explainlabel=None
-button8=None
-purificationlabel=None
-purificationbutton=None
-crystalinelabel=None
-crystalinebutton=None
-ascensionlabel=None
-ascensionbutton=None
-clickbutton=None
-# astral_buttons REMOVED
-challenge_widgets = {} # Stores labels and buttons for each challenge
-relic_widgets = {}
-exit_challenge_button = None # Button to exit current challenge
-relic_title = None # Keep track of relic title label
+# --- UI Update Function ---
+ptslbl, ppslbl, clkslbl, sdlbl, asclvllbl, ascproglbl = (None,) * 6
+upg1cstlbl, upg1explbl, btn1, upg2cstlbl, upg2explbl, btn2 = (None,) * 6
+upg3cstlbl, upg3explbl, btn3, upg4cstlbl, upg4explbl, btn4 = (None,) * 6
+upg5cstlbl, upg5explbl, btn5, upg6cstlbl, upg6explbl, btn6 = (None,) * 6
+upg7cstlbl, upg7explbl, btn7, upg8cstlbl, upg8explbl, btn8 = (None,) * 6
+purlbl, purbtn, crylbl, crybtn, asclbl, ascbtn, clkbtn = (None,) * 7
+nf_lbl, celestlbl, celestbtn = None, None, None
+chal_wdgs, relic_wdgs = {}, {}; exitchalbtn, relic_title_lbl = None, None
+stats_text = None
+help_text, help_buttons = None, {}
+notebook_ref = None # Reference to the main notebook widget
+tab_frames = {} # Map tab name/index to frame widget and unlock check function
 
-
-def update_button_style(button, state):
-    """Updates button bootstyle and tk state."""
-    if not button or not isinstance(button, ttk.Button): return
+def update_button_style(btn, state):
+    if not btn or not isinstance(btn, ttk.Button): return
     try:
-        style = "primary-outline" # Default
-        tk_state = tk.NORMAL
-        if state == "maxed":
-            style = "secondary-outline" # Less prominent than danger for maxed
-            tk_state = tk.DISABLED
-        elif state == "buyable": style = "success" # Solid color for buyable
-        elif state == "locked":
-            style = "secondary-outline"
-            tk_state = tk.DISABLED
-        elif state == "disabled": # General disabled state
-             style = "secondary-outline"
-             tk_state = tk.DISABLED
-        elif state == "active": # For active challenge button
-             style = "warning" # Yellow for active
-             tk_state = tk.DISABLED
-        button.configure(bootstyle=style, state=tk_state)
-    except tk.TclError: pass # Ignore errors if widget destroyed during update
+        style = "primary-outline"; tk_state = tk.NORMAL
+        if state == "maxed": style = "secondary-outline"; tk_state = tk.DISABLED
+        elif state == "buyable": style = "success"
+        elif state == "locked": style = "secondary-outline"; tk_state = tk.DISABLED
+        elif state == "disabled": style = "secondary-outline"; tk_state = tk.DISABLED
+        elif state == "active": style = "warning"; tk_state = tk.DISABLED
+        elif state == "info": style = "info"; # Used for active help button
+        btn.configure(bootstyle=style, state=tk_state)
+    except tk.TclError: pass
     except Exception as e: logging.error(f"Button style error: {e}")
 
 def updateui():
-    global points, clicks, pps, g, window, is_running # Use global 'g'
+    global pts, clks, pps, g, window, is_running, notebook_ref, tab_frames
     try:
         if not is_running or not window.winfo_exists(): return
+        fmt_max = lambda v: 'Inf' if ma.isinf(v) else int(v)
 
-        # --- Helper ---
-        def fmt_max(v): return 'Inf' if ma.isinf(v) else int(v)
-
-        # --- Update Top Labels ---
-        if pointlabel: pointlabel.configure(text=f"Points: {format_number(points)}")
-        if ppslabel: ppslabel.configure(text=f"PPS: {format_number(pps)}")
-        if clicklabel: clicklabel.configure(text=f"Clicks: {format_number(clicks)}")
-        if stardustlabel: stardustlabel.configure(text=f"Stardust: {format_number(g.sd)}")
+        # --- Update Tab Visibility/Names ---
+        if notebook_ref and tab_frames:
+            for i, tab_id in enumerate(notebook_ref.tabs()):
+                tab_info = tab_frames.get(i)
+                if tab_info:
+                    frame_widget, unlock_func, base_name = tab_info
+                    is_unlocked = unlock_func() if unlock_func else True
+                    tab_text = base_name if is_unlocked else obfuscate(base_name)
+                    try: notebook_ref.tab(tab_id, text=tab_text)
+                    except tk.TclError: pass # Ignore if tab doesn't exist
 
         # --- Prestige Tab ---
-        if purificationlabel and purificationbutton:
-            # Recalculate max purify here to ensure it reflects current state
-            current_pur_max = 20.0 if g.cr5_comp else (15.0 if g.upg5_comp else 10.0)
-
-            next_lvl = g.pur_cnt + 1
-            can, reason, desc = False, "Max", ""
-            cost = g.pur_cost / g.p24_pur_cost_div # Use P24 divisor
-
-            # Challenge C6 Restriction
-            chal_c6_active = (g.active_chal == 'c6')
-
-            if chal_c6_active:
-                 can, reason = False, "In C6"
-            elif g.pur_cnt < current_pur_max:
-                if next_lvl <= 10: can=True
-                elif next_lvl <= 15:
-                    can=g.upg5_comp
-                    reason="Req Upg5"
-                else: # P16+
-                    can=g.cr5_comp
-                    reason="Req C5"
-
-                # Check affordability only if otherwise possible
-                if can and points < cost:
-                     can = False
-                     reason = "Need Pts"
-
-                desc_idx = g.pur_cnt
-                desc = PURIFY_DESCRIPTIONS[desc_idx] if desc_idx < len(PURIFY_DESCRIPTIONS) else f"P{next_lvl}"
-                if not can and reason!="Max": desc = f"({reason}) {desc}"
-                purificationlabel.configure(text=f"Purify {next_lvl}/{int(current_pur_max)}: {desc}\nCost: {format_number(cost)}")
-
-            else: # Max reached
-                purificationlabel.configure(text=f"Max Purifications ({g.pur_cnt}/{int(current_pur_max)})")
-
-            # Determine button state
-            if chal_c6_active: status = "disabled"
-            elif g.pur_cnt >= current_pur_max: status = "maxed"
-            elif can: status = "buyable"
-            elif reason in ["Req Upg5", "Req C5", "Need Pts"]: status = "default" # Not buyable, but unlockable
-            else: status = "locked" # Maxed or other reason
-            update_button_style(purificationbutton, status)
-
-
-        if crystalinelabel and crystalinebutton:
-            # Recalculate max cryst here
-            current_cryst_max = 5.0 if g.pur_cnt >= 15 else 4.0
-
-            next_lvl = g.cryst_cnt + 1
-            can, reason, desc = True, "", ""
-            cost=g.cryst_cost
-
-            if not g.cryst_unl: can,reason=False,"Req P10"
-            elif g.cryst_cnt >= current_cryst_max: can,reason=False,"Max"
-            elif g.cryst_cnt == 4 and g.pur_cnt < 15: can,reason=False,"Req P15"
-            # Check affordability only if otherwise possible
-            elif points < cost: can, reason = False, "Need Pts"
-
-            if reason=="Req P10":
-                crystalinelabel.configure(text="Locked (Requires P10)")
-                status = "locked"
-            elif reason=="Max":
-                crystalinelabel.configure(text=f"Max Crystallines ({g.cryst_cnt}/{int(current_cryst_max)})")
-                status = "maxed"
-            else:
-                desc_idx = g.cryst_cnt
-                desc = CRYSTALLINE_DESCRIPTIONS[desc_idx] if desc_idx < len(CRYSTALLINE_DESCRIPTIONS) else f"C{next_lvl}"
-                if not can and reason: desc = f"({reason}) {desc}"
-                crystalinelabel.configure(text=f"Crystalline {next_lvl}/{int(current_cryst_max)}: {desc}\nCost: {format_number(cost)}")
-                if can: status="buyable"
-                elif reason in ["Req P15", "Need Pts"]: status="default"
-                else: status="locked" # Should not happen if logic above is correct
-
-            update_button_style(crystalinebutton, status)
-
-        # --- Ascension Tab ---
-        if asc_lvl_label: asc_lvl_label.configure(text=f"Ascension Level: {g.asc_lvl}")
-        if asc_prog_label:
-            xp_needed = g.get_xp_for_level(g.asc_lvl + 1)
-            xp_curr = g.asc_xp
-            # Handle edge case where needed is 0 or inf
-            if xp_needed <= 0 or ma.isinf(xp_needed): prog_perc = 0.0
-            else: prog_perc = min(100.0, (xp_curr / xp_needed * 100)) # Cap at 100%
-            asc_prog_label.configure(text=f"XP: {format_number(xp_curr)} / {format_number(xp_needed)} ({prog_perc:.1f}%)")
-
-        if ascensionlabel and ascensionbutton:
-            can, reason, desc = True, "", ""
-            sd_preview=0
-            cost = g.asc_cost
-
-            if not g.asc_unl: can,reason=False,"Req C5"
-            elif g.active_chal: can, reason=False, f"In Chal {g.active_chal}"
-            elif points < cost: can, reason = False, "Need Pts"
-            else: # Calculate SD preview if possible
-                try:
-                    if points >= cost and not ma.isinf(points) and points > 0 :
-                         log_arg=max(1, points / max(1, cost)) # Prevent div by zero
-                         r_boost=get_relic_effect('relic_sd_gain', 1.0)
-                         p22_b = 1.1 if g.pur_cnt >= 22 else 1.0
-                         sd_preview = ma.floor( (1 + 0.5*ma.log10(log_arg)) * ma.sqrt(g.cryst_cnt+1) * g.chal_sd_boost * r_boost * p22_b )
-                         sd_preview=max(0,sd_preview) # Ensure non-negative
-                         if sd_preview == 0: reason = "Need More Pts for SD" # Reason why it's not buyable even if cost met
-                except (ValueError, OverflowError) as e:
-                     logging.debug(f"SD preview calc error: {e}")
-                     pass # Keep sd_preview as 0
-
-            desc = f"Reset ALL non-permanent progress for Stardust & XP.\nGain approx: {format_number(sd_preview)} SD"
-            if not can: desc = f"({reason}) {desc}"
-
-            ascensionlabel.configure(text=f"Ascend #{g.asc_cnt+1}: {desc}\nCost: {format_number(cost)} Points")
-
-            # Determine button state
-            if not g.asc_unl: status = "locked"
-            elif g.active_chal: status = "disabled" # Can't ascend in challenge
-            elif can and sd_preview > 0 : status = "buyable"
-            elif reason == "Need Pts": status = "default" # Affordability issue
-            elif reason == "Need More Pts for SD": status = "default" # Affordability issue (indirect)
-            else: status = "locked" # Other reason (e.g. Req C5)
-
-            update_button_style(ascensionbutton,status)
-
-        # --- Relics Tab ---
-        # Show/Hide entire tab content based on asc_first
-        if relic_title: # Check if title label exists
-             if g.asc_first:
-                 relic_title.grid() # Show title
-                 for rid, data in RELICS_DATA.items():
-                     widgets = relic_widgets.get(rid)
-                     if not widgets: continue
-                     name_lbl, desc_lbl, level_lbl, cost_lbl, buy_btn = widgets
-
-                     # Show relic widgets
-                     for w in widgets: w.grid() # Use grid() to show
-
-                     lvl = g.relic_lvls.get(rid, 0)
-                     max_lvl = data.get('max_level', RELIC_MAX_LEVEL)
-                     is_max = (max_lvl is not None and lvl >= max_lvl)
-
-                     level_text = f"Level: {lvl}" + (f"/{max_lvl}" if max_lvl is not None else f"/{RELIC_MAX_LEVEL}")
-                     level_lbl.configure(text=level_text)
-
-                     if is_max:
-                         cost_lbl.configure(text="Cost: MAX")
-                         update_button_style(buy_btn, "maxed")
-                     else:
-                         try:
-                             cost=round(data['cost_base']*(data['cost_scale']**lvl))
-                         except OverflowError:
-                             cost = float('inf')
-
-                         p23_reduction = 0.95 if g.pur_cnt >= 23 else 1.0
-                         final_cost = round(cost * p23_reduction) if ma.isfinite(cost) else float('inf')
-
-                         cost_str = f"Cost: {format_number(final_cost)} SD"
-                         if p23_reduction < 1.0 and ma.isfinite(final_cost): cost_str += " (P23)" # Shorten discount text
-                         elif ma.isinf(final_cost): cost_str = "Cost: ---" # Indicate overflow
-
-                         cost_lbl.configure(text=cost_str)
-                         status="buyable" if ma.isfinite(final_cost) and g.sd >= final_cost else "default"
-                         update_button_style(buy_btn,status)
-             else:
-                 # Hide all relic widgets if not ascended yet
-                  relic_title.grid_remove() # Hide title too
-                  for rid in RELICS_DATA:
-                     widgets = relic_widgets.get(rid)
-                     if widgets:
-                         for w in widgets: w.grid_remove()
-
+        if purlbl and purbtn:
+            max_p = g.pur_max; next_l = g.pur_cnt + 1; can, reason = False, "Max Level"
+            cst = g.pur_cst / g.p24_pur_cst_div; status = "default"
+            if g.pur_cnt < max_p:
+                if next_l <= 10: can=True
+                elif next_l <= 15: can=g.upg5_comp; reason="Req Upg5"
+                else: can=g.cr5_comp; reason="Req C5"
+                if can and pts < cst: can, reason = False, "Need Points"
+                elif can: reason = ""
+                idx=g.pur_cnt; desc=PURIFY_DESCRIPTIONS[idx] if idx<len(PURIFY_DESCRIPTIONS) else f"P{next_l} Effect"
+                if not can and reason not in ["Max Level", ""]: desc=f"({reason}) {desc}"
+                purlbl.configure(text=f"Purify ({g.pur_cnt}/{int(max_p)}): {desc}\nCost: {format_number(cst)} Points")
+                status = "buyable" if can else "default"
+            else: purlbl.configure(text=f"Purify ({g.pur_cnt}/{int(max_p)}): Max Level Reached"); status = "maxed"
+            update_button_style(purbtn, status)
+        if crylbl and crybtn:
+            max_c = g.cryst_max; next_l = g.cryst_cnt + 1; can, reason = False, "Locked"
+            cst=g.cryst_cst; status = "locked"
+            if g.cryst_unl:
+                reason = "Max Level"; status = "default"
+                if g.cryst_cnt < max_c:
+                    if next_l == 5 and g.pur_cnt < 15: reason = "Req P15"
+                    else:
+                         can = True
+                         if pts < cst: can, reason = False, "Need Points"
+                         else: reason = ""
+                    idx=g.cryst_cnt; desc=CRYSTALLINE_DESCRIPTIONS[idx] if idx<len(CRYSTALLINE_DESCRIPTIONS) else f"C{next_l} Effect"
+                    if not can and reason not in ["Max Level", ""]: desc=f"({reason}) {desc}"
+                    crylbl.configure(text=f"Crystalline ({g.cryst_cnt}/{int(max_c)}): {desc}\nCost: {format_number(cst)} Points")
+                    status = "buyable" if can else "default"
+                else: crylbl.configure(text=f"Crystalline ({g.cryst_cnt}/{int(max_c)}): Max Level Reached"); status = "maxed"
+            else: crylbl.configure(text="Crystalline: Locked (Requires P10)")
+            update_button_style(crybtn, status)
 
         # --- Upgrades Tab ---
-        # Upg 1
-        cost1 = g.upg1_cost
-        can_buy1 = points >= cost1 and g.upg1_lvl < g.upg1_max
-        if upgrade1costlabel: upgrade1costlabel.configure(text=f"Cost: {format_number(cost1)}")
-        if upgrade1explainlabel: upgrade1explainlabel.configure(text=f"+{(1.0+get_relic_effect('relic_u1_str',0.0)):.2f} Base Mult [{int(g.upg1_lvl)}/{fmt_max(g.upg1_max)}]")
-        if button1: update_button_style(button1, "maxed" if g.upg1_lvl>=g.upg1_max else ("buyable" if can_buy1 else "default"))
-        # Upg 2
-        cost2 = g.upg2_cost
-        chal_c1_active = (g.active_chal == 'c1')
-        can_buy2 = points >= cost2 and g.upg2_lvl < g.upg2_max and not chal_c1_active
-        if upgrade2costlabel: upgrade2costlabel.configure(text=f"Cost: {format_number(cost2)}")
-        if upgrade2explainlabel:
-            fact=get_upgrade2_factor(g)
-            upgrade2explainlabel.configure(text=f"Strength x{format_number(g.mult_str)} [{int(g.upg2_lvl)}/{fmt_max(g.upg2_max)}] (x{fact:.2f})") # Format strength
-        if button2:
-            status = "disabled" if chal_c1_active else ("maxed" if g.upg2_lvl>=g.upg2_max else ("buyable" if can_buy2 else "default"))
-            update_button_style(button2, status)
-        # Upg 3
-        cost3 = g.upg3_cost
-        chal_c3_active = (g.active_chal == 'c3')
-        can_buy3 = points >= cost3 and g.upg3_lvl < g.upg3_max and not chal_c3_active
-        if upgrade3costlabel: upgrade3costlabel.configure(text=f"Cost: {format_number(cost3)}")
-        if upgrade3explainlabel: upgrade3explainlabel.configure(text=f"PPS Exp ^{g.pps_exp:.3f} [{int(g.upg3_lvl)}/{fmt_max(g.upg3_max)}]")
-        if button3:
-            status = "disabled" if chal_c3_active else ("maxed" if g.upg3_lvl>=g.upg3_max else ("buyable" if can_buy3 else "default"))
-            update_button_style(button3, status)
-        # Upg 4
-        cost4 = g.upg4_cost
-        lock4=not g.cr1_u4_unl
-        can_buy4 = points >= cost4 and g.upg4_lvl < g.upg4_max and not lock4
-        if upgrade4costlabel: upgrade4costlabel.configure(text="Locked (C1)" if lock4 else f"Cost: {format_number(cost4)}")
-        if upgrade4explainlabel: upgrade4explainlabel.configure(text="???" if lock4 else f"+1 Max Upg3 [{int(g.upg4_lvl)}/{fmt_max(g.upg4_max)}]")
-        if button4:
-            status="locked" if lock4 else ("maxed" if g.upg4_lvl>=g.upg4_max else ("buyable" if can_buy4 else "default"))
-            update_button_style(button4, status)
+        if ptslbl: ptslbl.configure(text=f"Points: {format_number(pts)}")
+        if ppslbl: ppslbl.configure(text=f"PPS: {format_number(pps)}")
+        c1=g.upg1_cst; max1=g.upg1_max; lvl1=g.upg1_lvl
+        can1=pts>=c1 and int(lvl1)<int(max1) and not ma.isinf(c1)
+        if upg1cstlbl: upg1cstlbl.configure(text=f"Cost: {format_number(c1)}")
+        if upg1explbl: upg1explbl.configure(text=f"+{(1.0+get_relic_effect('relic_u1_str',0.0)):.2f} Base Mult [{int(lvl1)}/{fmt_max(max1)}]")
+        if btn1: update_button_style(btn1, "maxed" if int(lvl1)>=int(max1) else ("buyable" if can1 else "default"))
+        c2=g.upg2_cst; max2=g.upg2_max; lvl2=g.upg2_lvl
+        chal1_active=(g.active_chal=='c1'); can2=pts>=c2 and int(lvl2)<int(max2) and not chal1_active and not ma.isinf(c2)
+        if upg2cstlbl: upg2cstlbl.configure(text=f"Cost: {format_number(c2)}")
+        if upg2explbl: f=get_upgrade2_factor(); upg2explbl.configure(text=f"Mult Strength x{format_number(g.mult_str)} [{int(lvl2)}/{fmt_max(max2)}] (Base x{f:.2f})")
+        if btn2: s="disabled" if chal1_active else ("maxed" if int(lvl2)>=int(max2) else ("buyable" if can2 else "default")); update_button_style(btn2,s)
+        c3=g.upg3_cst; max3=g.upg3_max; lvl3=g.upg3_lvl
+        chal2_active=(g.active_chal=='c2'); can3=pts>=c3 and int(lvl3)<int(max3) and not chal2_active and not ma.isinf(c3)
+        if upg3cstlbl: upg3cstlbl.configure(text=f"Cost: {format_number(c3)}")
+        if upg3explbl: upg3explbl.configure(text=f"PPS Exponent ^{g.pps_exp:.3f} [{int(lvl3)}/{fmt_max(max3)}]") # Removed NF display here for space
+        if btn3: s="disabled" if chal2_active else ("maxed" if int(lvl3)>=int(max3) else ("buyable" if can3 else "default")); update_button_style(btn3,s)
+        c4=g.upg4_cst; max4=g.upg4_max; lvl4=g.upg4_lvl
+        lock4=not g.cr1_u4_unl; can4=pts>=c4 and int(lvl4)<int(max4) and not lock4 and not ma.isinf(c4)
+        if upg4cstlbl: upg4cstlbl.configure(text="Locked (Requires C1)" if lock4 else f"Cost: {format_number(c4)}")
+        if upg4explbl: upg4explbl.configure(text="???" if lock4 else f"+1 Max Upg3 [{int(lvl4)}/{fmt_max(max4)}]")
+        if btn4: s="locked" if lock4 else ("maxed" if int(lvl4)>=int(max4) else ("buyable" if can4 else "default")); update_button_style(btn4,s)
 
         # --- Clicking Tab ---
-        lock_click = not g.cr4_unl
-        if clickbutton:
-            crit_eff = get_relic_effect('relic_crit_c', 0.0) # Get additive relic crit
-            crit=f" ({ (g.clk_crit_c)*100:.1f}% Crit, x{g.clk_crit_m:.1f})" if g.upg7_lvl > 0 or crit_eff > 0 else ""
-            relic_m=get_relic_effect('relic_clk_mult', 1.0)
-            asc_clk_m=g.get_asc_clk_boost()
-            # Click value shown should reflect boosts
-            click_v = g.clk_pow * g.chal_perm_clk_boost * asc_clk_m * g.clk_pt_scale * relic_m
-            clickbutton.configure(text=f"Click! (+{format_number(click_v)}{crit})" if not lock_click else "Locked (C4)", state=tk.NORMAL if not lock_click else tk.DISABLED)
-
-        # Click Upg 5, 6, 7, 8
+        if clkslbl: clkslbl.configure(text=f"Clicks: {format_number(clks)}")
+        lock_click_mech = not g.cr4_unl
+        if clkbtn:
+            clk_val_str = "???"; crit_str = ""; btn_state = tk.DISABLED
+            if not lock_click_mech:
+                btn_state = tk.NORMAL
+                relic_m=get_relic_effect('relic_clk_mult'); asc_m=g.get_asc_clk_boost()
+                chal_p_m = g.chal_perm_clk_bst; scale_m = g.clk_pt_scale; click_val = 0.0
+                if any(ma.isinf(v) for v in [g.clk_pow, chal_p_m, asc_m, scale_m, relic_m]): click_val = float('inf')
+                else:
+                    try: click_val = g.clk_pow * chal_p_m * asc_m * scale_m * relic_m
+                    except OverflowError: click_val = float('inf')
+                clk_val_str = format_number(click_val)
+                crit_chance = min(1.0, (0.05 * g.upg7_lvl) + get_relic_effect('relic_crit_c', 0.0))
+                crit_mult = 2.0 + (0.2 * g.upg7_lvl)
+                if crit_chance > 0: crit_str = f" ({crit_chance*100:.1f}% Crit, x{crit_mult:.1f})"
+            clkbtn.configure(text=f"Click! (+{clk_val_str}{crit_str})" if not lock_click_mech else "Locked (Requires C4)", state=btn_state)
         lock_click_upgs = not g.cr4_unl
-        # Upg5
-        req5 = 1000.0
-        st5, ct5, et5 = "locked", "Locked (C4)", "???"
+        r5=10.0; c5_str=f"Cost:{format_number(r5)} Clicks"; e5_str="Unlock P11-15"; s5="locked"
         if not lock_click_upgs:
-            if g.upg5_comp: st5, ct5, et5 = "maxed", "Purchased", f"Max Purify: 15"
-            else:
-                # Click upgrades requiring clicks check current clicks
-                st5 = "buyable" if clicks >= req5 else "default"
-                ct5 = f"Cost: {format_number(req5)} Clicks"
-                et5 = "Unlock P11-15"
-        if upgrade5costlabel: upgrade5costlabel.configure(text=ct5)
-        if upgrade5explainlabel: upgrade5explainlabel.configure(text=et5)
-        if button5: update_button_style(button5, st5)
-        # Upg6
-        req6 = 100000.0
-        st6, ct6, et6 = "locked", "Locked (C4)", "???"
+            if g.upg5_comp: s5, c5_str, e5_str = "maxed", "Purchased", "Max Purify -> 15"
+            else: s5 = "buyable" if clks>=r5 else "default"
+        else: c5_str, e5_str = "Locked(C4)", "???"
+        if upg5cstlbl: upg5cstlbl.configure(text=c5_str)
+        if upg5explbl: upg5explbl.configure(text=e5_str)
+        if btn5: update_button_style(btn5, s5)
+        r6=1000.0; c6_str=f"Cost:{format_number(r6)} Clicks"; e6_str="Enable C5 Effects"; s6="locked"
         if not lock_click_upgs:
-            if g.upg6_comp: st6, ct6, et6 = "maxed", "Purchased", "C5 Effects Active"
-            else:
-                st6 = "buyable" if clicks >= req6 else "default"
-                ct6 = f"Cost: {format_number(req6)} Clicks"
-                et6 = "Enable C5 Effects"
-        if upgrade6costlabel: upgrade6costlabel.configure(text=ct6)
-        if upgrade6explainlabel: upgrade6explainlabel.configure(text=et6)
-        if button6: update_button_style(button6, st6)
-        # Upg7 (Crit)
-        cost7 = g.upg7_cost
-        st7, ct7, et7 = "locked", "Locked (C4)", "???"
+            if g.upg6_comp: s6, c6_str, e6_str = "maxed", "Purchased", "Playtime Boost Active"
+            else: s6 = "buyable" if clks>=r6 else "default"
+        else: c6_str, e6_str = "Locked(C4)", "???"
+        if upg6cstlbl: upg6cstlbl.configure(text=c6_str)
+        if upg6explbl: upg6explbl.configure(text=e6_str)
+        if btn6: update_button_style(btn6, s6)
+        c7=g.upg7_cst; max7=g.upg7_max; lvl7=g.upg7_lvl
+        ct7_str=f"Cost:{format_number(c7)} Clicks"; e7_str=f"Crit Chance/Mult [{int(lvl7)}/{fmt_max(max7)}]"; s7="locked"
         if not lock_click_upgs:
-            if g.upg7_lvl >= g.upg7_max: st7, ct7, et7 = "maxed", "MAXED", f"Crit: {g.clk_crit_c*100:.1f}% x{g.clk_crit_m:.1f}"
-            else:
-                st7 = "buyable" if clicks >= cost7 else "default"
-                ct7 = f"Cost: {format_number(cost7)} Clicks"
-                et7 = f"Crit Chance/Mult [{int(g.upg7_lvl)}/{fmt_max(g.upg7_max)}]"
-        if upgrade7costlabel: upgrade7costlabel.configure(text=ct7)
-        if upgrade7explainlabel: upgrade7explainlabel.configure(text=et7)
-        if button7: update_button_style(button7, st7)
-        # Upg8 (Auto)
-        cost8 = g.upg8_cost
-        chal_c7_active = (g.active_chal == 'c7')
-        st8, ct8, et8 = "locked", "Locked (C4)", "???"
+            crit_chance = min(1.0,(0.05*lvl7)+get_relic_effect('relic_crit_c',0.0))
+            crit_mult = 2.0+(0.2*lvl7)
+            if int(lvl7)>=int(max7): s7, ct7_str, e7_str = "maxed", "MAXED", f"Crit: {crit_chance*100:.1f}% x{crit_mult:.1f}"
+            else: s7="buyable" if clks>=c7 and not ma.isinf(c7) else "default"
+        else: ct7_str, e7_str = "Locked(C4)", "???"
+        if upg7cstlbl: upg7cstlbl.configure(text=ct7_str)
+        if upg7explbl: upg7explbl.configure(text=e7_str)
+        if btn7: update_button_style(btn7, s7)
+        c8=g.upg8_cst; max8=g.upg8_max; lvl8=g.upg8_lvl
+        ct8_str=f"Cost:{format_number(c8)} Clicks"; e8_str=f"Auto Click CPS [{int(lvl8)}/{fmt_max(max8)}]"; s8="locked"
         if not lock_click_upgs:
-            # Show combined auto click speed
-            auto_s = f"{g.auto_cps:.2f}/s" if g.auto_cps > 0 else ("Passive" if g.p18_pass_clk > 0 else "0/s")
+            auto_cps_str = format_number(g.auto_cps)
+            if int(lvl8)>=int(max8): s8, ct8_str, e8_str = "maxed", "MAXED", f"Auto Click: {auto_cps_str}/s"
+            else: s8="buyable" if clks>=c8 and not ma.isinf(c8) else "default"
+        else: ct8_str, e8_str = "Locked(C4)", "???"
+        if upg8cstlbl: upg8cstlbl.configure(text=ct8_str)
+        if upg8explbl: upg8explbl.configure(text=e8_str)
+        if btn8: update_button_style(btn8, s8)
 
-            if chal_c7_active: st8, ct8, et8 = "disabled", "Disabled (C7)", "Auto Click Disabled"
-            elif g.upg8_lvl >= g.upg8_max: st8, ct8, et8 = "maxed", "MAXED", f"Auto Click: {auto_s}"
+        # --- Ascension Tab ---
+        if sdlbl: sdlbl.configure(text=f"Stardust: {format_number(g.sd)}")
+        if asclvllbl: asclvllbl.configure(text=f"Ascension Level: {int(g.asc_lvl)}")
+        if ascproglbl:
+            current_xp = g.asc_xp; needed_xp = g.get_xp_for_level(int(g.asc_lvl) + 1); prog_perc = 0.0
+            if needed_xp > 0 and not ma.isinf(needed_xp):
+                if ma.isinf(current_xp): prog_perc = 100.0
+                elif ma.isfinite(current_xp): prog_perc = min(100.0, (current_xp / needed_xp * 100.0))
+            ascproglbl.configure(text=f"Ascension XP: {format_number(current_xp)} / {format_number(needed_xp)} ({prog_perc:.1f}%)")
+        if asclbl and ascbtn:
+            can_asc, reason = False, "Locked"; status = "locked"; sd_preview = 0; cst = g.asc_cst
+            if g.asc_unl:
+                reason = ""; status = "default"
+                if g.active_chal: reason = f"In Challenge {g.active_chal}"; status = "disabled"
+                elif pts < cst: reason = "Need Points"
+                else:
+                    try:
+                        if pts >= cst and ma.isfinite(pts) and pts > 0:
+                             log_a=ma.log10(max(1, pts/max(1,cst))); base_sd=1+0.5*log_a
+                             c_m=ma.sqrt(g.cryst_cnt+1); r_b=get_relic_effect('relic_sd_gain'); c_b=g.chal_sd_bst
+                             p22=1.1 if g.pur_cnt>=22 else 1.0; nf_b = g.get_nf_stardust_boost()
+                             all_b = c_m*r_b*c_b*p22*nf_b
+                             if ma.isinf(all_b) or ma.isinf(base_sd): sd_preview = float('inf')
+                             else: sd_preview = ma.floor(base_sd * all_b); sd_preview=max(0,sd_preview)
+                             if sd_preview > 0: can_asc = True; status = "buyable"
+                             else: reason = "Need More Points for SD"
+                    except Exception as e: logging.error(f"SD preview calc error: {e}"); reason = "Preview Error"
+            desc = f"Reset Crystalline, Purify, Points, Clicks, etc.\nGain ~{format_number(sd_preview)} Stardust & Ascension XP.\nCost: {format_number(cst)} Points"
+            if not can_asc and reason: desc = f"({reason}) {desc}"
+            asclbl.configure(text=f"Ascend ({g.asc_cnt}): {desc}")
+            update_button_style(ascbtn,status)
+
+        # --- Relics Tab ---
+        show_relics = g.asc_first
+        if relic_f and relic_f.winfo_exists(): # Check frame exists
+            if show_relics:
+                 # Make sure the frame itself is visible if needed
+                 # This assumes relic_f is directly added to the notebook
+                 # If it's inside another container, adjust accordingly
+                 # if not relic_f.winfo_ismapped(): relic_f.grid() # Or pack() depending on layout
+
+                 if relic_title_lbl and not relic_title_lbl.winfo_ismapped(): relic_title_lbl.grid()
+                 for rid, data in RELICS_DATA.items():
+                     wdgs = relic_wdgs.get(rid)
+                     if not wdgs: continue
+                     nl, dl, ll, cl, bb = wdgs
+                     for w in wdgs:
+                         if w and w.winfo_exists() and not w.winfo_ismapped(): w.grid() # Show widgets if hidden
+
+                     lvl = g.relic_lvls.get(rid, 0); max_l = data.get('max_level', RELIC_MAX_LEVEL)
+                     is_max = (max_l is not None and int(lvl) >= int(max_l))
+                     eff_power = get_relic_effect(rid, '?'); eff_power_str = format_number(eff_power) if eff_power != '?' else '?'
+                     dl.configure(text=f"{data['desc']} (Eff: {eff_power_str})")
+                     ll.configure(text=f"Level: {int(lvl)}" + (f"/{int(max_l)}" if max_l is not None else f"/{int(RELIC_MAX_LEVEL)}"))
+                     if is_max: cl.configure(text="Cost: MAX"); update_button_style(bb, "maxed")
+                     else:
+                         try: base_cost=round(data['cost_base']*(data['cost_scale']**lvl))
+                         except OverflowError: base_cost = float('inf')
+                         p23_reduc=0.95 if g.pur_cnt>=23 else 1.0
+                         final_cost = round(base_cost * p23_reduc) if ma.isfinite(base_cost) else float('inf')
+                         cost_str = f"Cost: {format_number(final_cost)} SD"
+                         if p23_reduc < 1.0 and ma.isfinite(final_cost): cost_str += " (P23)"
+                         elif ma.isinf(final_cost): cost_str = "Cost: ---"
+                         cl.configure(text=cost_str)
+                         can_afford = ma.isinf(g.sd) or (ma.isfinite(final_cost) and g.sd >= final_cost)
+                         update_button_style(bb, "buyable" if can_afford else "default")
+            else: # Hide relics
+                 if relic_title_lbl and relic_title_lbl.winfo_ismapped(): relic_title_lbl.grid_remove()
+                 for rid in RELICS_DATA:
+                     if rid in relic_wdgs:
+                         for w in relic_wdgs[rid]:
+                             if w and w.winfo_exists() and w.winfo_ismapped(): w.grid_remove()
+
+        # --- Challenges Tab ---
+        show_chals = g.asc_first
+        # Use the frame defined during setup (chal_frame)
+        if chal_frame and chal_frame.winfo_exists():
+            if show_chals:
+                 if not chal_frame.winfo_ismapped(): chal_frame.grid() # Show challenges frame
+                 if exitchalbtn:
+                     if g.active_chal:
+                         if not exitchalbtn.winfo_ismapped(): exitchalbtn.grid()
+                         exitchalbtn.configure(text=f"Exit Challenge '{g.active_chal}'")
+                     else: exitchalbtn.grid_remove()
+                 for cid, wdgs in chal_wdgs.items():
+                     chal_data = CHALLENGES.get(cid);
+                     if not chal_data: continue
+                     lbl, btn = wdgs
+                     if not lbl.winfo_exists() or not btn.winfo_exists(): continue
+                     lvl = g.chal_comps.get(cid, 0); max_l = chal_data.get('mc')
+                     is_max = (max_l is not None and int(lvl) >= int(max_l)); is_active = (g.active_chal == cid)
+                     can_enter = (g.active_chal is None and not is_max)
+                     db = chal_data['db']; rd_str = "???"; rwd_str = "???"; rst_str = chal_data.get('restr', '???')
+                     try: req_val = chal_data['rf'](g, lvl); rd_str = chal_data['rd'](req_val)
+                     except Exception as e: rd_str = f"ReqErr:{e}"
+                     try: rwd_lvl = lvl if is_max else lvl + 1; rwd_str = chal_data['rwd'](g, rwd_lvl)
+                     except Exception as e: rwd_str = f"RewErr:{e}"
+                     comp_s = f" (Comps: {int(lvl)}/{int(max_l)})" if max_l is not None else f" (Comps: {int(lvl)})"
+                     stat_s = " [ACTIVE]" if is_active else (" [MAXED]" if is_max else "")
+                     lbl_t = f"{db}{comp_s}{stat_s}\n"
+                     if is_active:
+                          try:
+                              req = chal_data['rf'](g, lvl); prog = "..."
+                              if 'Points' in rd_str: prog = f"{format_number(pts)} / {format_number(req)}"
+                              elif 'Clicks' in rd_str: prog = f"{format_number(clks)} / {format_number(req)}"
+                              elif 'Cryst' in rd_str: prog = f"{g.cryst_cnt} / {req}"
+                              lbl_t += f"Progress: {prog}\n"
+                          except Exception as e: lbl_t += f"ProgErr:{e}\n"
+                     else: lbl_t += f"Next Req: {rd_str}\n"
+                     lbl_t += f"Reward: {rwd_str}\nRestrictions: {rst_str}"; lbl.configure(text=lbl_t)
+                     if is_active:
+                         if btn.winfo_ismapped(): btn.grid_remove()
+                     else:
+                         if not btn.winfo_ismapped(): btn.grid()
+                         btn.configure(text=f"Enter C{cid[1:]}")
+                         status = "maxed" if is_max else ("primary" if can_enter else "locked")
+                         update_button_style(btn, status)
+            else: # Hide challenges
+                 if chal_frame.winfo_ismapped(): chal_frame.grid_remove()
+
+        # --- Celestiality Tab ---
+        show_celest = g.celest_unl
+        if celest_f and celest_f.winfo_exists():
+             # Check g.celest_unl before showing elements
+             if nf_lbl:
+                 nf_lbl.configure(text=f"Nebula Fragments: {format_number(g.nebula_fragments)}")
+                 nf_lbl.grid() if show_celest else nf_lbl.grid_remove()
+             if celestlbl:
+                 # (Label text generation logic from previous step)
+                 can_cel, reason = False, "Locked"; status = "locked"; cst = g.celest_cst
+                 req_met = (int(g.asc_lvl) >= CELESTIALITY_REQ_ASC_LVL and int(g.cryst_cnt) >= CELESTIALITY_REQ_CRYST and int(g.pur_cnt) >= CELESTIALITY_REQ_PUR)
+                 if g.celest_unl:
+                     reason = ""; status = "default"
+                     if not req_met: reason = f"Req: Asc{CELESTIALITY_REQ_ASC_LVL}, C{CELESTIALITY_REQ_CRYST}, P{CELESTIALITY_REQ_PUR}"; status = "locked"
+                     elif g.active_chal: reason = f"In Challenge {g.active_chal}"; status = "disabled"
+                     elif pts < cst: reason = "Need Points"
+                     else: can_cel = True; status = "buyable"
+                 elif req_met: g.celest_unl = True; reason = ""; status = "default"
+                 if pts < cst: reason = "Need Points"
+                 else: can_cel = True; status = "buyable"
+                 nf_pt_boost = g.get_nf_point_boost(); nf_sd_boost = g.get_nf_stardust_boost(); nf_relic_boost = g.get_nf_relic_boost(); nf_gain_preview = 0.0
+                 if can_cel:
+                      try:
+                          point_factor = ma.log10(max(1.0, pts / NEBULA_FRAG_BASE_REQ_PTS)) if ma.isfinite(pts) and pts > 0 else 0.0
+                          sd_factor = ma.log10(max(1.0, g.sd / NEBULA_FRAG_BASE_REQ_SD)) if ma.isfinite(g.sd) and g.sd > 0 else 0.0
+                          asc_factor = ma.sqrt(max(0, g.asc_lvl / NEBULA_FRAG_BASE_REQ_ASC)) if ma.isfinite(g.asc_lvl) and g.asc_lvl > 0 else 0.0
+                          base_gain = max(0.0, point_factor) + max(0.0, sd_factor) + max(0.0, asc_factor); nf_gain_preview = ma.floor(base_gain * 1.0); nf_gain_preview = max(0.0, nf_gain_preview)
+                      except: nf_gain_preview = 0.0
+                 desc = (f"Perform a FULL reset (Points...SD, Relics, Chals).\n"
+                         f"Current Boosts: Pts x{format_number(nf_pt_boost)}, SD x{format_number(nf_sd_boost)}, Relics x{format_number(nf_relic_boost)}\n"
+                         f"Gain ~{format_number(nf_gain_preview)} Nebula Fragments on reset.\n"
+                         f"Cost: {format_number(cst)} Points")
+                 if not can_cel and reason: desc = f"({reason}) {desc}"
+                 celestlbl.configure(text=f"Celestiality ({g.celest_cnt}): {desc}")
+                 celestlbl.grid() if show_celest else celestlbl.grid_remove()
+             if celestbtn:
+                 update_button_style(celestbtn, status if show_celest else "locked")
+                 celestbtn.grid() if show_celest else celestbtn.grid_remove()
+
+        # --- Statistics Tab ---
+        # Stats tab should always be visible, just update content
+        if stats_text and stats_text.winfo_exists():
+            stats_content = "--- Game State ---\n"
+            stats_content += f"Playtime: {dt.timedelta(seconds=int(g.playtime))}\n"
+            stats_content += f"Points (p): {format_number(pts)}\n"
+            stats_content += f"PPS (pps): {format_number(pps)}\n"
+            stats_content += f"Clicks (c): {format_number(clks)}\n"
+            stats_content += f"Auto CPS (auto_cps): {format_number(g.auto_cps)}\n"
+            stats_content += f"Click Power Base (clk_pow): {format_number(g.clk_pow)}\n"
+            stats_content += f"Click Point Scale (clk_pt_scale): {format_number(g.clk_pt_scale)}\n"
+            stats_content += f"Click Crit Chance (clk_crit_c): {g.clk_crit_c*100:.1f}%\n"
+            stats_content += f"Click Crit Multi (clk_crit_m): x{format_number(g.clk_crit_m)}\n"
+            stats_content += "\n--- Prestige ---\n"
+            stats_content += f"Purify Count (pur_cnt): {int(g.pur_cnt)} / {int(g.pur_max)}\n"
+            stats_content += f"Purify Cost (pur_cst): {format_number(g.pur_cst / g.p24_pur_cst_div)}\n"
+            stats_content += f"Crystalline Count (cryst_cnt): {int(g.cryst_cnt)} / {int(g.cryst_max)}\n"
+            stats_content += f"Crystalline Cost (cryst_cst): {format_number(g.cryst_cst)}\n"
+            stats_content += f"Ascension Count (asc_cnt): {int(g.asc_cnt)}\n"
+            stats_content += f"Ascension Cost (asc_cst): {format_number(g.asc_cst)}\n"
+            stats_content += f"Stardust (sd): {format_number(g.sd)}\n"
+            stats_content += f"Ascension Level (asc_lvl): {int(g.asc_lvl)}\n"
+            current_xp = g.asc_xp; needed_xp = g.get_xp_for_level(int(g.asc_lvl) + 1)
+            stats_content += f"Ascension XP (asc_xp): {format_number(current_xp)} / {format_number(needed_xp)}\n"
+            stats_content += f"Celestiality Count (celest_cnt): {int(g.celest_cnt)}\n"
+            stats_content += f"Nebula Fragments (nebula_fragments): {format_number(g.nebula_fragments)}\n"
+            stats_content += f"Celestiality Cost (celest_cst): {format_number(g.celest_cst)}\n"
+            stats_content += "\n--- Core Modifiers ---\n"
+            stats_content += f"Base Multiplier (mult): x{format_number(g.mult)}\n"
+            stats_content += f"Multiplier Strength (mult_str): x{format_number(g.mult_str)}\n"
+            stats_content += f"PPS Exponent (pps_exp): ^{format_number(g.pps_exp)}\n"
+            stats_content += f"PPS Point Scale Exp (pps_pt_scale_exp): ^{format_number(g.pps_pt_scale_exp)}\n"
+            stats_content += "\n--- Upgrade Levels & Costs ---\n"
+            stats_content += f"Upg1: {int(g.upg1_lvl)}/{fmt_max(g.upg1_max)} | Cost: {format_number(g.upg1_cst)}\n"
+            stats_content += f"Upg2: {int(g.upg2_lvl)}/{fmt_max(g.upg2_max)} | Cost: {format_number(g.upg2_cst)}\n"
+            stats_content += f"Upg3: {int(g.upg3_lvl)}/{fmt_max(g.upg3_max)} | Cost: {format_number(g.upg3_cst)}\n"
+            stats_content += f"Upg4: {int(g.upg4_lvl)}/{fmt_max(g.upg4_max)} | Cost: {format_number(g.upg4_cst)}\n"
+            stats_content += f"Upg5 (P11-15): {'Yes' if g.upg5_comp else 'No'} | Cost: {format_number(10.0)} C\n"
+            stats_content += f"Upg6 (C5 Boost): {'Yes' if g.upg6_comp else 'No'} | Cost: {format_number(1000.0)} C\n"
+            stats_content += f"Upg7 (Crit): {int(g.upg7_lvl)}/{fmt_max(g.upg7_max)} | Cost: {format_number(g.upg7_cst)} C\n"
+            stats_content += f"Upg8 (Auto): {int(g.upg8_lvl)}/{fmt_max(g.upg8_max)} | Cost: {format_number(g.upg8_cst)} C\n"
+            stats_content += "\n--- Relics ---\n"
+            if not g.relic_lvls: stats_content += "(None)\n"
             else:
-                st8 = "buyable" if clicks >= cost8 else "default"
-                ct8 = f"Cost: {format_number(cost8)} Clicks"
-                et8 = f"Auto Click Speed [{int(g.upg8_lvl)}/{fmt_max(g.upg8_max)}]"
-
-        if upgrade8costlabel: upgrade8costlabel.configure(text=ct8)
-        if upgrade8explainlabel: upgrade8explainlabel.configure(text=et8)
-        if button8: update_button_style(button8, st8)
-
-        # --- Challenges Tab (Task 3 & 6 UI) ---
-        show_obfuscated = not g.asc_first # Obfuscate if not ascended once
-
-        # Update Exit Challenge button visibility
-        if exit_challenge_button:
-            if g.active_chal:
-                exit_challenge_button.grid() # Show button
-                exit_challenge_button.configure(text=f"Exit Challenge '{g.active_chal}'")
+                for rid, data in RELICS_DATA.items():
+                    lvl = g.relic_lvls.get(rid, 0)
+                    if lvl > 0: stats_content += f"{data['name']} (Lvl {int(lvl)})\n"
+            stats_content += "\n--- Challenges ---\n"
+            if not g.chal_comps: stats_content += "(None Completed)\n"
             else:
-                exit_challenge_button.grid_remove() # Hide button
+                for cid, data in CHALLENGES.items():
+                    comps = g.chal_comps.get(cid, 0)
+                    if comps > 0: stats_content += f"{data['db']} (Comps: {int(comps)})\n"
+            stats_content += "\n--- Internal Flags ---\n"
+            stats_content += f"Crystalline Unl (cryst_unl): {g.cryst_unl}\n"
+            stats_content += f"Ascension Unl (asc_unl): {g.asc_unl}\n"
+            stats_content += f"First Ascension (asc_first): {g.asc_first}\n"
+            stats_content += f"Celestiality Unl (celest_unl): {g.celest_unl}\n"
+            stats_content += f"Limit Break (p20_lim_brk): {g.p20_lim_brk}\n"
+            stats_content += f"Active Challenge (active_chal): {g.active_chal}\n"
 
-        for cid, widgets in challenge_widgets.items():
-            chal=CHALLENGES[cid]
-            lbl, enter_btn = widgets # Unpack label and button
+            try:
+                 current_state = stats_text.state
+                 stats_text.state = tk.NORMAL
+                 stats_text.delete('1.0', tk.END)
+                 stats_text.insert('1.0', stats_content)
+                 stats_text.state = tk.DISABLED
+            except tk.TclError: pass # Ignore errors if widget is destroyed
 
-            lvl=g.chal_comps.get(cid,0)
-            max_l=chal.get('max_completions')
-            is_max=(max_l is not None and lvl>=max_l)
-            is_active = (g.active_chal == cid)
-            can_enter = (g.active_chal is None and g.asc_first and not is_max)
+        # --- Help Tab ---
+        # Help tab should always be visible, update button states/text
+        if help_buttons and help_text:
+            for topic, button in help_buttons.items():
+                if not button.winfo_exists(): continue
+                unlocked = False
+                if topic == 'points': unlocked = True
+                elif topic == 'purify': unlocked = g.pur_cnt > 0 or g.cryst_unl
+                elif topic == 'crystalline': unlocked = g.cryst_cnt > 0 or g.asc_unl
+                elif topic == 'clicking': unlocked = g.cr4_unl
+                elif topic == 'ascension': unlocked = g.asc_first
+                elif topic == 'relics': unlocked = g.asc_first
+                elif topic == 'challenges': unlocked = g.asc_first
+                elif topic == 'celestiality': unlocked = g.celest_unl
 
-            # --- Build Text ---
-            desc_base = chal['desc_base']
-            req_desc = "???"
-            rew_desc = "???"
-            restrict_desc = chal.get('restrictions_desc', '???')
+                btn_text = topic.replace('_', ' ').title()
+                button.configure(text=btn_text if unlocked else obfuscate(btn_text))
 
-            if not show_obfuscated or is_max or is_active: # Show details if completed, active, or ascended
-                try:
-                    req=chal['requirement_func'](g,lvl)
-                    req_desc=chal['requirement_desc_func'](req)
-                except Exception as e: req_desc = f"Req Error: {e}" # Show error in UI
-                try:
-                     # Show reward for *next* level if not maxed
-                     rew_desc=chal['reward_desc_func'](g, lvl + (0 if is_max else 1))
-                except Exception as e: rew_desc = f"Reward Error: {e}"
-            else: # Obfuscate if not ascended and not completed/active
-                desc_base = obfuscate(desc_base)
-                req_desc = obfuscate(req_desc)
-                rew_desc = obfuscate(rew_desc)
-                restrict_desc = obfuscate(restrict_desc)
+                if _active_help_topic == topic:
+                     # Keep active style if unlocked, otherwise force locked style
+                     update_button_style(button, "info" if unlocked else "locked")
+                else:
+                     # Set normal or locked style
+                     update_button_style(button, "primary" if unlocked else "locked")
 
-            comp_s=f" ({lvl}/{max_l})" if max_l is not None else f" ({lvl})"
-            status_text = ""
-            if is_active: status_text = " [ACTIVE]"
-            elif is_max: status_text = " [MAXED]"
-            elif not g.asc_first: status_text = " [LOCKED]"
-
-            lbl_txt=f"{desc_base}{comp_s}{status_text}\n"
-            if is_active:
-                 # Show current progress towards requirement
-                 try:
-                     req = chal['requirement_func'](g, lvl)
-                     # This part needs custom logic per challenge type
-                     prog = "..." # Default progress string
-                     if 'Points' in req_desc: prog = f"{format_number(points)} / {format_number(req)}"
-                     elif 'Clicks' in req_desc: prog = f"{format_number(clicks)} / {format_number(req)}"
-                     elif 'Crystalline' in req_desc: prog = f"{g.cryst_cnt} / {req}"
-                     # Add time limit display for C2
-                     elif cid == 'c2': prog = f"{format_number(clicks)} / {format_number(req)} Clicks ({g.playtime:.0f}/120s)"
-
-                     lbl_txt += f"Progress: {prog}\n"
-                 except Exception as e: lbl_txt += f"Progress Error: {e}\n"
-            else:
-                 lbl_txt += f"Next Req: {req_desc}\n"
-
-            lbl_txt += f"Reward: {rew_desc}\nRestrictions: {restrict_desc}"
-            lbl.configure(text=lbl_txt)
-
-            # --- Update Button State ---
-            if is_active:
-                enter_btn.grid_remove() # Hide enter button when active
-            else:
-                enter_btn.grid() # Show enter button
-                enter_btn.configure(text=f"Enter C{cid[1:]}") # Shorten text e.g. Enter C1
-                if is_max: btn_state = "maxed"
-                elif can_enter: btn_state = "primary" # Use solid primary to invite click
-                else: btn_state = "locked" # Cannot enter (in another chal or not ascended)
-                update_button_style(enter_btn, btn_state)
-
-        # --- Reschedule ---
+        # Schedule next update
         if is_running: window.after(UPDATE_INTERVAL_MS, updateui)
-    except tk.TclError:
-        logging.warning("UI Update TclError (likely window closed).")
-        is_running = False # Stop loops if UI fails critically
+
+    except tk.TclError as e: is_running = False # Stop if UI fails critically
     except Exception as e:
         logging.error(f"UI update error: {e}", exc_info=True)
-        # Delay rescheduling slightly on error to prevent rapid error loops
-        if is_running: window.after(UPDATE_INTERVAL_MS * 5, updateui)
+        if is_running: window.after(UPDATE_INTERVAL_MS * 5, updateui) # Retry after delay
 
-admin_window = None
-admin_widgets = {}
-active_admin_threads = [] # Stores TIDs of running background commands
-
-# --- Admin Panel Helpers ---
-
-def log_to_admin_output_threadsafe(m):
-    """Safely logs a message to the admin output widget from any thread."""
-    # Assumes 'window' is the main tk root window defined elsewhere
-    if admin_widgets.get('cmd_output') and window and is_running:
-        try:
-            # Use window.after to schedule the UI update on the main thread
-            window.after(0, lambda msg=m: log_to_admin_output(msg))
-        except Exception: pass # Ignore if window/tk is gone
-
-def _execute_single_command(cmd_str, log_output=True):
-    """Executes a single admin command string. Internal use."""
-    global is_running, COMMAND_HANDLERS # Need handlers dict
+# --- Admin Panel ---
+admin_window = None; admin_wdgs = {}; active_admin_thds = []
+def log_admin_ts(m):
+    if admin_wdgs.get('cmd_output') and window and is_running:
+        try: window.after(0, lambda msg=m: log_admin(msg))
+        except: pass
+def _exec_cmd(cmd_str, log_out=True):
     if not cmd_str or not is_running: return None
-
-    parts = cmd_str.split()
-    cmd = parts[0].lower()
-    args = parts[1:]
-    res = None
-    handler_data = COMMAND_HANDLERS.get(cmd)
-
-    if handler_data:
-        try:
-            # Call the function associated with the command
-            func = handler_data['func']
-            res = func(args) # Pass the arguments list
-        except Exception as e:
-            res = f"Exec Error '{cmd}': {e}"
-            logging.error(f"Admin cmd '{cmd}' error: {e}", exc_info=True)
-    else:
-        res = f"Unknown command: '{cmd}'."
-
-    # Log the result unless it's a background task or logging is off
-    # Check if the function is one known to run in the background
-    background_funcs = [cmd_wait, cmd_repeat, cmd_while]
-    should_log = log_output and res and (handler_data is None or handler_data['func'] not in background_funcs)
-
-    if should_log:
-        # Ensure logging happens on the main thread if needed
-        log_to_admin_output_threadsafe(str(res))
-    return res # Return result for potential chaining or internal use
-
-def _evaluate_condition(cond_str):
-    """Evaluates a simple condition string 'var op val'. Internal use."""
-    global points, clicks, g # Need access to game state
+    parts=cmd_str.split(); cmd=parts[0].lower(); args=parts[1:]; res=None; h=COMMAND_HANDLERS.get(cmd)
+    if h:
+        try: res = h['func'](args)
+        except Exception as e: res=f"Exec Error '{cmd}': {e}"; logging.error(f"Admin err '{cmd}': {e}", exc_info=True)
+    else: res = f"Unknown cmd: '{cmd}'. Type 'help'."
+    bg=[cmd_wait,cmd_repeat,cmd_while]; log=log_out and res and (h is None or h['func'] not in bg)
+    if log: log_admin_ts(str(res)); return res
+def _eval_cond(cond_s):
     try:
-        parts = cond_str.split()
-        if len(parts) != 3: raise ValueError("Condition must be 'var op val'")
-        var, op, val_str = parts[0].lower(), parts[1], parts[2]
-
-        current_value = None
-        value_source = None
-
-        # Check globals first
-        if var in ['points', 'clicks', 'pps']:
-            current_value = globals().get(var)
-            value_source = "Global"
-        # Check GameState 'g'
-        elif hasattr(g, var):
-            current_value = getattr(g, var)
-            value_source = "GameState"
-        else:
-            raise NameError(f"Variable '{var}' not found.")
-
-        if current_value is None:
-            # Treat None as 0 for comparisons, might need adjustment
-            current_value = 0
-
-        # Determine the type for comparison
-        target_type = type(current_value)
-        compare_value = None
-
-        # Convert val_str to the appropriate type
+        parts = cond_s.split(maxsplit=2);
+        if len(parts) != 3: raise ValueError("Condition must be 'variable operator value'")
+        var, op, val_s = parts; var = var.lower(); cur=None
+        if var in ['pts','clks','pps']: cur = globals().get(var)
+        elif hasattr(g, var): cur = getattr(g, var)
+        else: raise NameError(f"Variable '{var}' not found")
+        if cur is None: raise ValueError(f"Variable '{var}' has value None.")
+        typ=type(cur); cmp=None
         try:
-            if target_type == bool:
-                compare_value = val_str.lower() in ['true', '1', 't', 'y']
-            elif target_type == int:
-                compare_value = int(float(val_str)) # Allow scientific notation
-            elif target_type == float:
-                compare_value = float(val_str)
-            elif target_type == str:
-                compare_value = val_str
-            elif isinstance(current_value, (int, float)): # Handle cases where type is int/float but loaded differently
-                 compare_value = float(val_str)
-            else:
-                raise TypeError(f"Unsupported type '{target_type.__name__}' for comparison.")
-        except ValueError:
-             raise TypeError(f"Cannot convert '{val_str}' to expected type '{target_type.__name__}'.")
-
-
-        # Perform comparison
-        if op == '==': return current_value == compare_value
-        elif op == '!=': return current_value != compare_value
-        # Numerical comparisons require numbers
-        elif isinstance(current_value, (int, float)) and isinstance(compare_value, (int, float)):
-            if op == '>': return current_value > compare_value
-            elif op == '<': return current_value < compare_value
-            elif op == '>=': return current_value >= compare_value
-            elif op == '<=': return current_value <= compare_value
-            else: raise ValueError(f"Unsupported operator '{op}' for numbers.")
-        elif op in ['>', '<', '>=', '<=']: # Tried numerical op on non-numerical type
-            raise TypeError(f"Operator '{op}' requires numerical types (got {target_type.__name__}).")
-        else:
-            raise ValueError(f"Unsupported operator '{op}'.")
-
-    except Exception as e:
-        log_to_admin_output_threadsafe(f"Condition Error: {e}")
-        logging.warning(f"Condition eval error '{cond_str}': {e}")
-        return False # Default to False on any error
-
-# --- Admin Command Functions ---
-
-def cmd_setvalue(args): # Updated for 'g' and new vars
-    global points, clicks, g # Use 'g'
+            if typ is bool: cmp=val_s.lower() in ['true','1','t','y','yes']
+            elif typ is int: cmp=int(float(val_s))
+            elif typ is float: cmp=float(val_s)
+            elif typ is str: cmp=val_s
+            elif cur is None and val_s.lower() == 'none': cmp=None
+            else: raise TypeError(f"Unsupported type {typ}")
+        except ValueError: raise TypeError(f"Cannot convert '{val_s}' to {typ}")
+        if op=='==' or op == 'is': return cur==cmp;
+        elif op=='!=' or op == 'is not': return cur!=cmp
+        if isinstance(cur,(int,float)) and isinstance(cmp,(int,float)):
+            if op=='>': return cur>cmp
+            elif op=='<': return cur<cmp
+            elif op=='>=': return cur>=cmp
+            elif op=='<=': return cur<=cmp
+        raise ValueError(f"Unsupported op '{op}' for type {typ}")
+    except Exception as e: log_admin_ts(f"Condition Error: {e}"); return False
+def cmd_setvalue(args):
+    global pts, clks, g
     if len(args)!=2: return "Usage: set <var> <val>"
-    var,val_str=args[0].lower(),args[1]
-    tgt=None
-    is_g=False # Is it a global variable like points/clicks?
-    cur=None
-    old=None
-
-    # Check globals first
-    if var in ['points', 'clicks', 'pps', 'is_running']: # Add other globals if needed
-        tgt=globals()
-        is_g=True
-        cur=tgt.get(var) # Use get for safety
-        old=cur
-    # Check GameState 'g' attributes
-    elif hasattr(g, var):
-        tgt=g
-        cur=getattr(g, var)
-        old=cur
-    else: return f"Error: Var '{var}' not found in globals or game state."
-
-    if cur is None and not is_g: # Safety check if getattr returned None unexpectedly
-        # Allow setting None values if needed, maybe? For now, assume we want a type.
-         logging.warning(f"Var '{var}' exists but is None. Attempting to set anyway.")
-         # pass
-
-    tp=type(cur) if cur is not None else None # Get type from current value if possible
-    new=None
-
+    var,val_s=args[0].lower(),args[1]; tgt=None; is_global=False; current_val=None; old_val=None
+    if var in ['pts','clks','pps','is_running']: tgt=globals(); is_global=True; current_val=tgt.get(var)
+    elif hasattr(g, var): tgt=g; current_val=getattr(g, var)
+    else: return f"Error: Variable '{var}' not found."
+    old_val = current_val; target_type = type(current_val) if current_val is not None else None; new_value = None
     try:
-        # Explicit type checks for known state variables
-        if var in ['asc_first', 'p20_lim_brk', 'upg5_comp', 'upg6_comp', 'cryst_unl', 'asc_unl', 'r2_unl', 'r3_unl', 'r6_unl', 'cr1_u4_unl', 'cr3_unl', 'cr4_unl', 'cr5_comp', 'p12_auto_u4']:
-             new = val_str.lower() in ['true', '1', 't', 'y']; tp = bool
-        elif var in ['asc_lvl', 'asc_cnt', 'pur_cnt', 'cryst_cnt', 'upg1_lvl', 'upg2_lvl', 'upg3_lvl', 'upg4_lvl', 'upg7_lvl', 'upg8_lvl']:
-            new = int(float(val_str)); tp = int
-        elif var in ['upg1_max','upg2_max','upg3_max','upg4_max','upg7_max','upg8_max']: # Handle float max levels
-            if val_str.lower() in ['inf', 'infinity']: new = float('inf'); tp = float
-            else: new = float(val_str); tp = float
-        elif var in ['asc_xp', 'sd', 'pps_exp', 'clk_pow', 'mult', 'mult_str', 'r1_boost', 'r3_cost_m', 'r4_u2_boost', 'r5_u3_boost', 'r6_boost', 'cr1_boost', 'cr2_boost', 'cryst_comp_bonus', 'p11_pps_boost', 'p14_u2_boost', 'p16_cost_reduc', 'p17_u1_boost', 'p18_pass_clk', 'p19_boost', 'p24_pur_cost_div', 'chal_sd_boost', 'chal_perm_clk_boost', 'chal_upg_cost_scale_mult', 'points', 'clicks', 'pps', 'upg1_cost', 'upg2_cost', 'upg3_cost', 'upg4_cost', 'upg7_cost', 'upg8_cost', 'pur_cost', 'cryst_cost', 'asc_cost', 'auto_cps', 'clk_pt_scale', 'pps_pt_scale_exp', 'chal_eff_pps_exp_mod', 'chal_eff_cost_exp_mod', 'clk_crit_c', 'clk_crit_m']:
-            new = float(val_str); tp = float
-        elif var == 'active_chal': # Handle setting active_chal to None
-            new = None if val_str.lower() == 'none' else val_str
-            tp = str if new is not None else type(None)
-        elif var in ['relic_lvls', 'chal_comps']:
-            new = ast.literal_eval(val_str) # Use literal_eval for safety
-            if not isinstance(new, dict): raise TypeError("Parsed value is not a dict")
-            tp = dict
-        # Fallback for other types or unknown variables
-        elif tp is not None:
-            if tp == bool: new=val_str.lower() in ['true','1','t','y']
-            elif tp == int: new=int(float(val_str))
-            elif tp == float: new=float(val_str)
-            elif tp == str: new=val_str
-            elif tp == dict:
-                 new=ast.literal_eval(val_str)
-                 if not isinstance(new,dict): raise TypeError("Parsed value is not a dict")
-            # Add list, set etc. if needed
-            else: raise TypeError(f"Unsupported type '{tp.__name__}' for auto-conversion.")
-        else: # Type is None (variable might not have been initialized yet or was None)
-            # Attempt literal_eval or default to string
-            try: new = ast.literal_eval(val_str); tp = type(new)
-            except: new = val_str; tp = str
-            log_to_admin_output_threadsafe(f"Warning: Type for '{var}' was None, guessed type '{tp.__name__}'.")
-
-    except Exception as e: return f"Error parsing '{val_str}' for {var} (Expected ~{tp.__name__ if tp else 'Unknown'}): {e}"
-
-    # Apply the change
-    if is_g: globals()[var]=new
-    else: setattr(tgt, var, new)
-
-    buff_msg=""
-    # Apply buffs if prestige counts increased (check correct vars: pur_cnt, cryst_cnt)
-    if not is_g and var in ['pur_cnt','cryst_cnt'] and isinstance(old,(int,float)) and isinstance(new,int) and new>old:
+        if target_type is bool or var in ['asc_first','p20_lim_brk','upg5_comp','upg6_comp','cryst_unl','asc_unl', 'celest_unl', 'r2_unl','r3_unl','r6_unl','cr1_u4_unl','cr3_unl','cr4_unl','cr5_comp','p12_auto_u4']: new_value = val_s.lower() in ['true','1','t','y','yes']; target_type = bool
+        elif target_type is int or var in ['asc_lvl','asc_cnt','pur_cnt','cryst_cnt', 'celest_cnt', 'upg1_lvl','upg2_lvl','upg3_lvl','upg4_lvl','upg7_lvl','upg8_lvl']: f_val = float(val_s); new_value = int(f_val); target_type = int
+        elif target_type is float or var in ['upg1_max','upg2_max','upg3_max','upg4_max','upg7_max','upg8_max', 'asc_xp','sd','pps_exp','clk_pow','mult','mult_str','r1_bst','r3_cst_m','r4_u2_bst','r5_u3_bst','r6_bst','cr1_bst','cr2_bst','cryst_comp_bst','p11_pps_bst','p14_u2_bst','p16_cst_reduc','p17_u1_bst','p18_pass_clk','p19_bst','p24_pur_cst_div','chal_sd_bst','chal_perm_clk_bst','chal_upg_cst_scale_mult', 'pts','clks','pps','upg1_cst','upg2_cst','upg3_cst','upg4_cst','upg7_cst','upg8_cst','pur_cst','cryst_cst','asc_cst', 'celest_cst', 'nebula_fragments', 'auto_cps','clk_pt_scale','pps_pt_scale_exp','chal_eff_pps_exp_mod','chal_eff_cst_exp_mod','clk_crit_c','clk_crit_m']: new_value = float(val_s); target_type = float
+        elif var=='active_chal': new_value = None if val_s.lower() in ['none','null','false','0',''] else val_s; target_type = type(new_value)
+        elif var in ['relic_lvls','chal_comps']: parsed = ast.literal_eval(val_s); new_value = {str(k): v for k, v in parsed.items()}; target_type = dict
+        elif target_type is str: new_value = val_s
+        elif target_type is None and var in ['active_chal']: new_value = None if val_s.lower() in ['none','null','false','0',''] else val_s; target_type = type(new_value)
+        else:
+            if target_type: new_value = target_type(val_s)
+            else:
+                 try: new_value = ast.literal_eval(val_s); target_type = type(new_value)
+                 except (ValueError, SyntaxError): new_value = val_s; target_type = str; log_admin_ts(f"Warning: Guessed str type for '{var}'.")
+    except (ValueError, TypeError, SyntaxError) as e: return f"Error parsing value '{val_s}' for '{var}': {e}"
+    if is_global: globals()[var] = new_value
+    else: setattr(tgt, var, new_value)
+    buff_msg = ""; recalc_needed = True
+    if not is_global and var in ['pur_cnt', 'cryst_cnt', 'celest_cnt'] and isinstance(old_val, (int, float)) and isinstance(new_value, int) and new_value > old_val:
         try:
-            old_i,new_i=int(old),int(new)
-            if new_i>old_i:
-                log_to_admin_output_threadsafe(f"ADMIN: Applying buffs for {var} from {old_i+1} to {new_i}")
-                if var=='pur_cnt':
-                    for i in range(old_i,new_i): apply_purification_effects(i)
-                    buff_msg=" P buffs applied."
-                elif var=='cryst_cnt':
-                    for i in range(old_i,new_i): apply_crystalline_effects(i+1) # Cryst levels are 1-based
-                    buff_msg=" C buffs applied."
-        except Exception as e:
-            log_to_admin_output_threadsafe(f"Buff Error: {e}")
-            logging.error(f"Buff Error: {e}",exc_info=True)
-
-    # Determine if recalculation is needed
-    needs_recalc = True # Default to true
-    vars_no_recalc_g = ['is_running'] # Globals not needing recalc
-    vars_no_recalc_gs = ['last_save_time','admin_panel_active', 'playtime'] # GS vars not needing recalc
-
-    if is_g and var in vars_no_recalc_g: needs_recalc = False
-    if not is_g and var in vars_no_recalc_gs: needs_recalc = False
-    # Special case: If setting asc_lvl/xp, level up check handles recalc
-    if var in ['asc_lvl', 'asc_xp'] and not is_g:
-         needs_recalc = False # check_ascension_level_up will trigger recalc if needed
-         g.check_ascension_level_up()
-    # Special case: Setting active_chal might need recalc depending on challenge effects
-    if var == 'active_chal' and not is_g:
-        needs_recalc = True # Assume recalc needed to apply/remove challenge effects
-
-
-    res=f"Set {var} to {new!r}."
-    if needs_recalc:
-        recalculate_derived_values()
-        res+=" Recalculated."+buff_msg
-    elif buff_msg: # Buffs were applied, but recalc wasn't needed for the set var itself
-        recalculate_derived_values() # Still need recalc for buff effect
-        res+=buff_msg + " Recalculated (for buffs)."
-
-    return res
-
-
-def cmd_varinfo(args): # Updated for 'g'
-    global g
+            old_int, new_int = int(old_val), int(new_value); log_admin_ts(f"ADMIN: Retro buffs {var} {old_int+1}..{new_int}")
+            if var == 'pur_cnt': [apply_purification_effects(i) for i in range(old_int, new_int)]; buff_msg = " P buffs."
+            elif var == 'cryst_cnt': [apply_crystalline_effects(i + 1) for i in range(old_int, new_int)]; buff_msg = " C buffs."
+            # No direct buff application for celest_cnt, effects derived from NF
+        except Exception as e: log_admin_ts(f"Buff Err: {e}")
+    elif not is_global and var == 'cr4_unl' and new_value is True and old_val is False: apply_crystalline_effects(4); buff_msg = " C4 effects."
+    no_recalc_globals = ['is_running']; no_recalc_gamestate = ['last_save_time', 'admin_panel_active', 'playtime', 'needs_recalc_from_click_xp']
+    if (is_global and var in no_recalc_globals) or (not is_global and var in no_recalc_gamestate): recalc_needed = False
+    if not is_global and var in ['asc_lvl', 'asc_xp']: recalc_needed = False; g.check_ascension_level_up()
+    if var == 'asc_lvl' and isinstance(new_value, (int,float)) and new_value > old_val: g.check_celestiality_unlock()
+    result_msg = f"Set {var} to {new_value!r}."
+    if recalc_needed: recalculate_derived_values(); result_msg += f" Recalc.{buff_msg}"
+    elif buff_msg: recalculate_derived_values(); result_msg += f"{buff_msg} Recalc(buffs)."
+    return result_msg
+def cmd_varinfo(args):
     if len(args)!=1: return "Usage: get <var>"
-    var=args[0].lower()
-    val=None
-    tp=None
-    source = "Not Found"
-    if var in globals():
-        val=globals().get(var)
-        source = "Global"
-    elif hasattr(g, var):
-        val=getattr(g, var)
-        source = "GameState"
-    else: return f"Error: Var '{var}' not found."
-
-    tp=type(val).__name__
-    # Format inf/nan nicely
-    if isinstance(val, float):
-        if ma.isinf(val): val_repr = "Infinity" if val > 0 else "-Infinity"
-        elif ma.isnan(val): val_repr = "NaN"
-        else: val_repr = repr(val)
-    else: val_repr = repr(val)
-    return f"{var} ({tp}) [{source}] = {val_repr}"
-
-
-def cmd_list(args): # Updated for 'g', 'pps'
-    global points, clicks, pps, g # Use 'g', 'pps'
-    if len(args)==0:
-        lines=["--- Game State (g) ---"]
-        # Sort attributes for consistent output
-        for k,v in sorted(vars(g).items()):
-             if not k.startswith('_'):
-                 # Format inf/nan nicely
-                 if isinstance(v, float):
-                     if ma.isinf(v): v_repr = "Infinity" if v > 0 else "-Infinity"
-                     elif ma.isnan(v): v_repr = "NaN"
-                     else: v_repr = repr(v)
-                 else: v_repr = repr(v)
-                 lines.append(f"  {k} ({type(v).__name__}) = {v_repr}")
-        lines.append("\n--- Globals ---")
-        lines.append(f"  points={repr(points)}")
-        lines.append(f"  clicks={repr(clicks)}")
-        lines.append(f"  pps={repr(pps)}") # Corrected global var name
-        lines.append(f"  is_running={repr(is_running)}")
-        return "\n".join(lines)
-    elif len(args)==1: return cmd_varinfo(args)
-    else: return "Usage: list [<var>]"
-
-
-def cmd_type(args): # Updated for 'g'
-    global g
+    var=args[0].lower(); val=None; source="Not Found"
+    if var in globals(): val=globals().get(var); source="Global"
+    elif hasattr(g, var): val=getattr(g, var); source="GameState (g)"
+    else:
+        if hasattr(g, args[0]): val = getattr(g, args[0]); source = "GameState (g) [Case Sensitive]"; var = args[0]
+        else: return f"Error: Variable '{args[0]}' not found."
+    type_name = type(val).__name__; value_repr = repr(val)
+    if isinstance(val, float): value_repr = format_number(val); value_repr += f" ({repr(val)})"
+    return f"{var} ({type_name}) [{source}] = {value_repr}"
+def cmd_list(args):
+    filter_term = args[0].lower() if args else None; lines = []
+    lines.append("--- Game State (g) ---")
+    for key, value in sorted(vars(g).items()):
+         if key.startswith('_'): continue
+         if filter_term and filter_term not in key.lower(): continue
+         type_name = type(value).__name__; value_repr = repr(value)
+         if isinstance(value, float) or key == 'nebula_fragments': value_repr = format_number(value)
+         lines.append(f"  {key} ({type_name}) = {value_repr}")
+    lines.append("\n--- Globals ---"); global_vars = {'pts': pts, 'clks': clks, 'pps': pps, 'is_running': is_running}
+    for key, value in sorted(global_vars.items()):
+        if filter_term and filter_term not in key.lower(): continue
+        type_name = type(value).__name__; value_repr = repr(value)
+        if isinstance(value, float): value_repr = format_number(value)
+        lines.append(f"  {key} ({type_name}) = {value_repr}")
+    if not args and len(lines) <= 3: return "No variables found matching filter."
+    elif len(lines) <= 3: return "No variables found."
+    return "\n".join(lines)
+def cmd_type(args):
     if len(args)!=1: return "Usage: type <var>"
-    var=args[0].lower()
-    tp=None
-    if var in globals(): tp=type(globals().get(var)).__name__
-    elif hasattr(g, var): tp=type(getattr(g, var)).__name__
-    else: return f"Error: Var '{var}' not found."
-    return f"Type of '{var}' is {tp}"
-
-def cmd_limbrk(args): # Updated for 'g' and shortened vars
-    global g
-    count=0
-    logf=log_to_admin_output if th.current_thread() is th.main_thread() else log_to_admin_output_threadsafe
-    targets=[]
-    target_vars = [k for k in g.__dict__ if k.endswith('_max')] # Find all vars ending in _max
-
-    if not args or args[0].lower()=='all':
-        targets=target_vars
+    var=args[0].lower(); type_name=None
+    if var in globals(): type_name=type(globals().get(var)).__name__
+    elif hasattr(g, var): type_name=type(getattr(g, var)).__name__
+    else: return f"Error: Variable '{var}' not found."
+    return f"Type of '{var}' is {type_name}"
+def cmd_limbrk(args):
+    global g; count=0; log_func=log_admin_ts; targets_to_break=[]
+    target_vars = [k for k in g.__dict__ if k.endswith('_max')];
+    if not args or args[0].lower()=='all': targets_to_break = target_vars
     else:
-        var=args[0].lower()
-        tgt=None
-        # Try matching common patterns
-        if f"{var}_max" in target_vars: tgt=f"{var}_max"
-        elif var in target_vars: tgt = var # Allow providing full name like 'upg1_max'
-        # Add more specific checks if needed (e.g., 'upg1' -> 'upg1_max')
-        elif var.startswith("upg") and var[3:].isdigit() and f"upg{var[3:]}_max" in target_vars:
-            tgt = f"upg{var[3:]}_max"
-
-        if tgt: targets.append(tgt)
-        else: return f"Error: Cannot find a '_max' var related to '{args[0]}'."
-
-    if not targets: return "No _max vars found or matched."
-    for t in targets:
-        if hasattr(g,t):
+        var_name = args[0].lower(); target = None
+        if f"{var_name}_max" in target_vars: target = f"{var_name}_max"
+        elif var_name in target_vars: target = var_name
+        elif var_name.startswith("upg") and var_name[3:].isdigit() and f"upg{var_name[3:]}_max" in target_vars: target = f"upg{var_name[3:]}_max"
+        if target: targets_to_break.append(target)
+        else: return f"Error: No matching '_max' variable found for '{args[0]}'."
+    if not targets_to_break: return "No target variables specified or found."
+    for target_var in targets_to_break:
+        if hasattr(g, target_var):
             try:
-                current_val = getattr(g,t)
-                # Check if it's numeric before setting to inf
-                if isinstance(current_val,(int,float)):
-                    setattr(g,t,float('inf'))
-                    count+=1
-                    logf(f"Set {t} to Inf.")
-                else: logf(f"Warn: {t} is not numeric ({type(current_val).__name__}), skipped.")
-            except Exception as e: logf(f"Error setting {t} to inf: {e}")
-        else: logf(f"Warn: Attribute {t} not found on 'g' (should not happen).")
-
-
-    if count>0:
-        recalculate_derived_values() # Max levels affect calculations
-        return f"Set {count} max limits to inf. Recalculated."
-    else: return "No limits changed."
-
-def cmd_settype(args): # Updated for 'g'
-    global g
+                current_value = getattr(g, target_var)
+                if isinstance(current_value, (int, float)): setattr(g, target_var, float('inf')); count += 1; log_func(f"Set {target_var} limit to Infinity.")
+                else: log_func(f"Warning: {target_var} not numeric, skipped.")
+            except Exception as e: log_func(f"Error setting {target_var} to Inf: {e}")
+    if count > 0: recalculate_derived_values(); return f"Set {count} variable limits to Infinity. Recalculated."
+    else: return "No variable limits were changed."
+def cmd_settype(args):
     if len(args)!=2: return "Usage: settype <var> <type>"
-    var,t_str=args[0].lower(),args[1].lower()
-    tgt=None
-    is_g=False
-    cur=None
-    if var in globals():
-        tgt=globals()
-        is_g=True
-        cur=tgt.get(var)
-    elif hasattr(g, var):
-        tgt=g
-        cur=getattr(g, var)
-    else: return f"Error: Var '{var}' not found."
-
-    new=None
+    var, type_str = args[0].lower(), args[1].lower(); target=None; is_global=False; current_val=None
+    if var in globals(): target=globals(); is_global=True; current_val=target.get(var)
+    elif hasattr(g, var): target=g; current_val=getattr(g, var)
+    else: return f"Error: Variable '{var}' not found."
+    new_value = None
     try:
-        current_val_str = str(cur) # Convert current value to string for conversion
-        if t_str=='int': new=int(float(current_val_str))
-        elif t_str=='float': new=float(current_val_str)
-        elif t_str=='str': new=str(current_val_str)
-        elif t_str=='bool': new=bool(cur) # Bool conversion uses truthiness
-        elif t_str=='dict': new=ast.literal_eval(current_val_str); assert isinstance(new,dict)
-        elif t_str=='list': new=ast.literal_eval(current_val_str); assert isinstance(new,list)
-        # Add 'set' if needed
-        else: return f"Error: Unsupported target type '{t_str}'."
-
-        if is_g: globals()[var]=new
-        else: setattr(tgt, var, new)
-
-        # Check if recalc needed based on variable name (similar to setvalue)
-        needs_recalc = True
-        vars_no_recalc_g = ['is_running']
-        vars_no_recalc_gs = ['last_save_time','admin_panel_active', 'playtime', 'active_chal']
-        if is_g and var in vars_no_recalc_g: needs_recalc = False
-        if not is_g and var in vars_no_recalc_gs: needs_recalc = False
-
-        res = f"Set type of '{var}' to {t_str}. New value: {new!r}."
-        if needs_recalc:
-             recalculate_derived_values()
-             res += " Recalculated."
-        return res
-
-    except Exception as e: return f"Error converting '{var}' (value: {cur!r}) to type {t_str}: {e}"
-
-def cmd_buy(args): # Updated for 'g', relics max level, challenges, pre-checks
-    global g, points, clicks # Use 'g', needs points/clicks for checks
+        current_val_str = str(current_val); target_type = None
+        if type_str == 'int': target_type = int; new_value = int(float(current_val_str))
+        elif type_str == 'float': target_type = float; new_value = float(current_val_str)
+        elif type_str == 'str': target_type = str; new_value = current_val_str
+        elif type_str == 'bool': target_type = bool; new_value = current_val_str.lower() in ['true', '1', 't', 'y', 'yes']
+        elif type_str == 'dict': target_type = dict; parsed = ast.literal_eval(current_val_str); new_value = parsed
+        elif type_str == 'list': target_type = list; parsed = ast.literal_eval(current_val_str); new_value = parsed
+        elif type_str in ['none', 'nonetype']: target_type = type(None); new_value = None
+        else: return f"Error: Unsupported target type '{type_str}'."
+        if is_global: globals()[var] = new_value
+        else: setattr(target, var, new_value)
+        recalc_needed = True; no_recalc_globals = ['is_running']; no_recalc_gamestate = ['last_save_time', 'admin_panel_active', 'playtime', 'needs_recalc_from_click_xp', 'active_chal']
+        if (is_global and var in no_recalc_globals) or (not is_global and var in no_recalc_gamestate): recalc_needed = False
+        result_msg = f"Attempted type change '{var}' to {type_str}. New: {new_value!r}."
+        if recalc_needed: recalculate_derived_values(); result_msg += " Recalc."
+        return result_msg
+    except (ValueError, TypeError, SyntaxError) as e: return f"Error converting '{var}' ({current_val!r}) to {type_str}: {e}"
+def cmd_buy(args):
     if len(args)<1 or len(args)>2: return "Usage: buy <id> [times=1]"
-    id_str=args[0].lower()
-    times=1
+    item_id = args[0].lower(); times_to_buy = 1
     if len(args)==2:
-        try:
-            times=int(args[1])
-            assert times>0
+        try: times_to_buy = int(args[1]); assert times_to_buy > 0
         except: return "Error: Invalid times."
-
-    # Map IDs to functions
-    funcs={'upg1':upgrade1,'upg2':upgrade2,'upg3':upgrade3,'upg4':upgrade4,'upg5':upgrade5,'upg6':upgrade6,'upg7':upgrade7,'upg8':upgrade8,
-           'purify':purify,'crystalline':crystalline,'ascend':ascend}
-    # Add relics to buyable map
-    for k in RELICS_DATA: funcs[k]=lambda k=k:buy_relic(k)
-
-    func=funcs.get(id_str)
-    if not func: return f"Error: Unknown Buy ID '{id_str}'."
-
-    bought=0
-    for i in range(times):
-        if not is_running: return f"Buy stopped after {bought} due to game closing."
-        # Pre-checks (can we even attempt the purchase due to restrictions, max levels, costs?)
-        can_attempt = True
-        reason="unknown"
-
-        # Challenge Restrictions first
-        if id_str == 'upg2' and g.active_chal == 'c1': can_attempt = False; reason = "in C1"
-        elif id_str == 'upg3' and g.active_chal == 'c3': can_attempt = False; reason = "in C3"
-        elif id_str == 'upg8' and g.active_chal == 'c7': can_attempt = False; reason = "in C7"
-        elif id_str == 'purify' and g.active_chal == 'c6': can_attempt = False; reason = "in C6"
-        elif id_str == 'ascend' and g.active_chal: can_attempt = False; reason = f"in Chal {g.active_chal}"
-
-        # Max Level / Resource / Unlock Checks (Only if not blocked by challenge)
-        if can_attempt:
-            if id_str in RELICS_DATA:
-                lvl=g.relic_lvls.get(id_str,0); data=RELICS_DATA[id_str]
-                max_l=data.get('max_level', RELIC_MAX_LEVEL)
-                if max_l is not None and lvl>=max_l: can_attempt=False; reason="relic max"
-                else:
-                    try: cost=round(data['cost_base']*(data['cost_scale']**lvl))
-                    except OverflowError: cost = float('inf')
-                    p23_reduction = 0.95 if g.pur_cnt >= 23 else 1.0
-                    final_cost = round(cost * p23_reduction) if ma.isfinite(cost) else float('inf')
-                    if g.sd < final_cost: can_attempt = False; reason="no SD"
-            elif id_str=='purify':
-                 cost = g.pur_cost / g.p24_pur_cost_div; current_max = 20.0 if g.cr5_comp else (15.0 if g.upg5_comp else 10.0)
-                 if g.pur_cnt >= current_max: can_attempt = False; reason = "max purify"
-                 elif g.pur_cnt >= 10 and not g.upg5_comp: can_attempt = False; reason = "req Upg5"
-                 elif g.pur_cnt >= 15 and not g.cr5_comp: can_attempt = False; reason = "req C5"
-                 elif points < cost: can_attempt = False; reason = "no points"
-            elif id_str=='crystalline':
-                 cost = g.cryst_cost; current_max = 5.0 if g.pur_cnt >= 15 else 4.0
-                 if not g.cryst_unl: can_attempt = False; reason = "locked P10"
-                 elif g.cryst_cnt >= current_max: can_attempt = False; reason = "max cryst"
-                 elif g.cryst_cnt == 4 and g.pur_cnt < 15: can_attempt = False; reason = "req P15"
-                 elif points < cost: can_attempt = False; reason = "no points"
-            elif id_str=='ascend':
-                 cost = g.asc_cost
-                 if not g.asc_unl: can_attempt = False; reason = "locked C5"
-                 elif points < cost: can_attempt = False; reason = "no points"
-                 # Add 0 SD gain check? Could be slow. Function itself checks this.
-            elif id_str=='upg1' and (g.upg1_lvl>=g.upg1_max or points < g.upg1_cost): can_attempt=False; reason="max/cost upg1"
-            elif id_str=='upg2' and (g.upg2_lvl>=g.upg2_max or points < g.upg2_cost): can_attempt=False; reason="max/cost upg2"
-            elif id_str=='upg3' and (g.upg3_lvl>=g.upg3_max or points < g.upg3_cost): can_attempt=False; reason="max/cost upg3"
-            elif id_str=='upg4' and (g.upg4_lvl>=g.upg4_max or points < g.upg4_cost or not g.cr1_u4_unl): can_attempt=False; reason="max/cost/lock upg4"
-            elif id_str=='upg5' and (g.upg5_comp or clicks < 1000 or not g.cr4_unl): can_attempt=False; reason="comp/cost/lock upg5"
-            elif id_str=='upg6' and (g.upg6_comp or clicks < 100000 or not g.cr4_unl): can_attempt=False; reason="comp/cost/lock upg6"
-            elif id_str=='upg7' and (g.upg7_lvl>=g.upg7_max or clicks < g.upg7_cost or not g.cr4_unl): can_attempt=False; reason="max/cost/lock upg7"
-            elif id_str=='upg8' and (g.upg8_lvl>=g.upg8_max or clicks < g.upg8_cost or not g.cr4_unl): can_attempt=False; reason="max/cost/lock upg8"
-
-        if not can_attempt:
-            # Only show message if trying to buy multiple times or first attempt failed
-            if times > 1 or bought == 0:
-                res=f"Bought {id_str} {bought}x."
-                res+=f" Stopped (Pre-check: {reason})."
-                return res
-            else: # If buying once and failed precheck, function itself likely handled message
-                 return f"Buy {id_str} failed ({reason})."
-
-
-        # Attempt the purchase
-        try:
-            # Store state before buying to detect change more reliably
-            state_before_json = json.dumps({k: getattr(g, k) for k in g.__dict__ if not k.startswith('_')}, default=str) # Use default=str for non-serializable
-            points_before, clicks_before, sd_before = points, clicks, g.sd
-            func() # Execute the buy function
-            state_after_json = json.dumps({k: getattr(g, k) for k in g.__dict__ if not k.startswith('_')}, default=str)
-            points_after, clicks_after, sd_after = points, clicks, g.sd
-
-            # Check if relevant state changed
-            succeeded = False
-            if state_before_json != state_after_json: succeeded = True
-            elif points_before != points_after: succeeded = True
-            elif clicks_before != clicks_after: succeeded = True
-            elif sd_before != sd_after: succeeded = True
-
-            if succeeded:
-                bought+=1
-            else: # Function executed but state didn't change (means couldn't afford or hit max internally)
-                 # Don't return error if buying just once, function likely handled it
-                 if times == 1: return f"Buy {id_str}: No change detected (Afford/Max/Unlock check failed)."
-                 else:
-                     res=f"Bought {id_str} {bought}x."
-                     res+=f" Stopped (No change detected - Afford/Max/Unlock check failed inside function)."
-                     return res
-
-        except Exception as e:
-            res=f"Bought {id_str} {bought}x."
-            res+=f" Error on attempt {bought+1}: {e}"
-            logging.error(f"Buy Error during {id_str}: {e}", exc_info=True)
-            return res
-
-        # Post-checks (did we hit a max level defined in GameState?)
-        # This is mainly useful when buying multiple times to stop early
-        is_maxed=False
-        if id_str=='upg1' and g.upg1_lvl>=g.upg1_max: is_maxed=True
-        elif id_str=='upg2' and g.upg2_lvl>=g.upg2_max: is_maxed=True
-        elif id_str=='upg3' and g.upg3_lvl>=g.upg3_max: is_maxed=True
-        elif id_str=='upg4' and g.upg4_lvl>=g.upg4_max: is_maxed=True
-        elif id_str=='upg5' and g.upg5_comp: is_maxed=True # Completion flag
-        elif id_str=='upg6' and g.upg6_comp: is_maxed=True # Completion flag
-        elif id_str=='upg7' and g.upg7_lvl>=g.upg7_max: is_maxed=True
-        elif id_str=='upg8' and g.upg8_lvl>=g.upg8_max: is_maxed=True
-        elif id_str in RELICS_DATA:
-            lvl=g.relic_lvls.get(id_str,0)
-            max_l=RELICS_DATA[id_str].get('max_level', RELIC_MAX_LEVEL)
-            if max_l is not None and lvl>=max_l:
-                is_maxed=True
-
-        if is_maxed and i < (times - 1): # Check if maxed before last iteration
-            res=f"Bought {id_str} {bought}x."
-            res+=f" Stopped (Maxed)."
-            return res
-
-    return f"Attempted {id_str} x{times}. Succeeded {bought}x."
-
+    buy_functions = {'upg1': upgrade1, 'upg2': upgrade2, 'upg3': upgrade3, 'upg4': upgrade4, 'upg5': upgrade5, 'upg6': upgrade6, 'upg7': upgrade7, 'upg8': upgrade8, 'purify': purify, 'crystalline': crystalline, 'ascend': ascend, 'celestiality': celestiality }
+    for relic_id in RELICS_DATA: buy_functions[relic_id] = lambda r=relic_id: buy_relic(r)
+    purchase_func = buy_functions.get(item_id)
+    if not purchase_func: return f"Error: Unknown Buy ID '{item_id}'."
+    succeeded_count = 0; stop_reason = ""
+    for i in range(times_to_buy):
+        if not is_running: stop_reason = f"Game stopped at attempt {i+1}."; break
+        state_before = {'pts': pts, 'clks': clks, 'sd': g.sd, 'lvl': getattr(g, f"{item_id}_lvl", None) if item_id.startswith('upg') and item_id[3].isdigit() else (g.relic_lvls.get(item_id) if item_id in RELICS_DATA else None), 'comp': getattr(g, f"{item_id}_comp", None) if item_id in ['upg5','upg6'] else None, 'count': getattr(g, f"{item_id}_cnt", None) if item_id in ['purify', 'crystalline', 'ascend', 'celestiality'] else None }
+        try: purchase_func()
+        except Exception as e: stop_reason = f"Error at attempt {i+1}: {e}"; logging.error(f"Admin Buy Err ({item_id}, att {i+1}): {e}", exc_info=True); break
+        state_after = {'pts': pts, 'clks': clks, 'sd': g.sd, 'lvl': getattr(g, f"{item_id}_lvl", None) if item_id.startswith('upg') and item_id[3].isdigit() else (g.relic_lvls.get(item_id) if item_id in RELICS_DATA else None), 'comp': getattr(g, f"{item_id}_comp", None) if item_id in ['upg5','upg6'] else None, 'count': getattr(g, f"{item_id}_cnt", None) if item_id in ['purify', 'crystalline', 'ascend', 'celestiality'] else None }
+        changed = False
+        if state_after['pts'] != state_before['pts'] or state_after['clks'] != state_before['clks'] or state_after['sd'] != state_before['sd'] or state_after['lvl'] != state_before['lvl'] or state_after['comp'] != state_before['comp'] or state_after['count'] != state_before['count']: changed = True
+        if changed: succeeded_count += 1
+        else:
+            is_maxed = False # Check if maxed
+            if item_id.startswith('upg') and item_id[3].isdigit(): maxl = getattr(g, f"{item_id}_max", float('inf')); is_maxed = state_after['level'] is not None and int(state_after['level']) >= int(maxl)
+            elif item_id in ['upg5', 'upg6']: is_maxed = state_after['comp'] is True
+            elif item_id in RELICS_DATA: maxl = RELICS_DATA[item_id].get('max_level', RELIC_MAX_LEVEL); is_maxed = state_after['level'] is not None and maxl is not None and int(state_after['level']) >= int(maxl)
+            if is_maxed: stop_reason = f"Stopped at attempt {i+1} (Maxed)."
+            else: stop_reason = f"Stopped at attempt {i+1} (No change - unaffordable?)."
+            break
+    result = f"Attempted '{item_id}' x{times_to_buy}. Succeeded {succeeded_count} time(s)."
+    if stop_reason: result += f" {stop_reason}"
+    return result
 def cmd_imprint(args):
-    global g
-    if len(args)!=2: return "Usage: imprint <var> <val>"
-    res=cmd_setvalue(args)
-    if "Error" not in res: save_game(); return f"{res} Saved."
-    else: return res
-
+    set_result = cmd_setvalue(args);
+    if "Error" not in set_result: save_game(); return f"{set_result} Saved."
+    else: return set_result
 def cmd_stop(args):
-    global is_running, window
-    save=True
-    if args and args[0].lower() in ['f','0','n', 'nosave']: save=False
-    msg = f"Shutdown initiated (Save: {save})..."; log_to_admin_output(msg); logging.info(msg)
-    if window: window.after(100, lambda s=save: on_closing(s)); return "Shutdown scheduled."
-    else: return "Error: Main window not found."
-
+    should_save = not (args and args[0].lower() in ['f','0','n','nosave','false'])
+    msg=f"Shutdown initiated (Save: {should_save})..."; log_admin(msg); logging.info(msg)
+    window.after(100, lambda save_flag=should_save: on_closing(save_flag))
+    return "Shutdown scheduled."
 def cmd_offline(args):
-    global points, clicks, g, pps
-    if len(args)!=1: return "Usage: offline <secs>"
+    if len(args)!=1: return "Usage: offline <seconds>"
     try:
-        secs=float(args[0]); assert secs>=0
-        if secs==0: return "Simulated 0s offline."
+        seconds = float(args[0]); assert seconds>=0; recalculate_derived_values()
+        offline_pps = pps * 0.5 if ma.isfinite(pps) else 0.0; offline_pts = offline_pps * seconds
+        offline_cps = g.auto_cps * 0.5 if ma.isfinite(g.auto_cps) else 0.0; offline_clks = offline_cps * seconds
+        current_pts = pts if ma.isfinite(pts) else float('inf'); current_clks = clks if ma.isfinite(clks) else float('inf')
+        try: pts = min(float('inf'), current_pts + offline_pts) if ma.isfinite(offline_pts) else float('inf')
+        except OverflowError: pts = float('inf')
+        try: clks = min(float('inf'), current_clks + offline_clks) if ma.isfinite(offline_clks) else float('inf')
+        except OverflowError: clks = float('inf')
         recalculate_derived_values()
-        offline_pps = pps * 0.5 if ma.isfinite(pps) else 0.0
-        offline_pts = offline_pps * secs
-        offline_cps = g.auto_cps * 0.5 if ma.isfinite(g.auto_cps) else 0.0
-        offline_cls = offline_cps * secs
-        try: points = min(float('inf'), points + offline_pts)
-        except OverflowError: points = float('inf')
-        try: clicks = min(float('inf'), clicks + offline_cls)
-        except OverflowError: clicks = float('inf')
-        return f"Simulated {secs:.1f}s offline. ~+{format_number(offline_pts)} P, ~+{format_number(offline_cls)} C."
-    except Exception as e: return f"Offline error: {e}"
-
-def cmd_recalc(args): recalculate_derived_values(); return "Recalculated values."
-
+        return f"Simulated {seconds:.1f}s offline. Gained ~+{format_number(offline_pts)} P, +{format_number(offline_clks)} C."
+    except (ValueError, AssertionError) as e: return f"Offline Err: Invalid input - {e}"
+    except Exception as e: return f"Offline Error: {e}"
+def cmd_recalc(args): recalculate_derived_values(); return "Derived values recalculated."
 def cmd_reset(args):
-    global g, points, clicks, window
-    if len(args)!=1: return "Usage: reset <purify|cryst|asc|save>"
-    type=args[0].lower(); reset_done = False
-    if type=="purify": reset_for_purify(); reset_done = True
-    elif type=="crystalline" or type=="cryst": reset_for_crystalline(); reset_done = True
-    elif type=="ascension" or type=="asc": reset_for_ascension(); reset_done = True
-    elif type=="save":
-        log_to_admin_output("Performing save reset...")
+    if not args: return "Usage: reset <purify | cryst | asc | celest | save>"
+    reset_type = args[0].lower()
+    if reset_type == "purify": reset_for_purify(); msg = "Purify progress reset."
+    elif reset_type in ["cryst", "crystalline"]: reset_for_crystalline(); msg = "Crystalline & Purify progress reset."
+    elif reset_type in ["asc", "ascension"]: reset_for_ascension(); msg = "Ascension, Crystalline & Purify progress reset."
+    elif reset_type in ["celest", "celestiality"]: reset_for_celestiality(); msg = "Celestiality Reset Done (Full reset incl. SD/Asc/Relics/Chals). NF Kept."
+    elif reset_type == "save":
+        log_admin("Attempting full save file reset..."); msg = "Save file reset failed."
         try:
-            if os.path.exists(SAVE_FILE): os.remove(SAVE_FILE); log_to_admin_output_threadsafe(f"Deleted {SAVE_FILE}")
-            else: log_to_admin_output_threadsafe("No save file found.")
-            g = GameState(); points = 0.0; clicks = 0.0
-            recalculate_derived_values(); save_game()
-            log_to_admin_output_threadsafe("Game reset & new save created.")
-            return "Save reset complete." # Return sync message
-        except Exception as e: return f"Save reset error: {e}"
-    else: return "Unknown reset type: purify, cryst, asc, save."
-    if reset_done: recalculate_derived_values(); return f"{type.capitalize()} reset. Recalculated."
-    else: return "Reset command finished (no action taken)."
-
+            if os.path.exists(SAVE_FILE): os.remove(SAVE_FILE); log_admin_ts(f"Deleted save file: {SAVE_FILE}")
+            else: log_admin_ts("Save file not found, skipping deletion.")
+            g = GameState(); pts,clks=0.0,0.0; recalculate_derived_values(); save_game()
+            log_admin_ts("Game state reset to default and saved."); msg = "Save file reset successfully."
+        except OSError as e: log_admin_ts(f"Error deleting save file: {e}"); msg = f"Error deleting save file: {e}"
+        except Exception as e: log_admin_ts(f"Error resetting game state: {e}"); msg = f"Error resetting game state: {e}"
+    else: return f"Unknown reset type '{reset_type}'. Use purify, cryst, asc, celest, or save."
+    if reset_type != "save": recalculate_derived_values() # Recalc after non-save resets
+    return msg
 def cmd_getchal(args):
-    global g
-    if len(args)!=1: return "Usage: getchal <id>"
-    cid=args[0].lower()
-    if cid not in CHALLENGES:
-        return f"Error: Chal '{cid}' not found."
-    chal=CHALLENGES[cid]
-    lvl=g.chal_comps.get(cid,0)
-    max_lvl=chal.get('max_completions')
-    is_max=(max_lvl is not None and lvl>=max_lvl)
-    status="WIP"
-    req_d = "Error"
-    rew_d = "Error"
-    req_val = None # Define req_val before try block
-    try:
-        req_val=chal['requirement_func'](g,lvl)
-        req_d=chal['requirement_desc_func'](req_val)
-    except Exception as e: req_d = f"ReqERR:{e}"
-    try:
-        rew_d=chal['reward_desc_func'](g, lvl + (0 if is_max else 1)) # Show next reward
-    except Exception as e: rew_d = f"RewERR:{e}"
-    if is_max: status="MAX"
-    elif g.active_chal == cid:
-         status="ACTIVE"
-         if req_val is not None: # Check if req_val was successfully calculated
-             try:
-                 if chal['check_func'](g,req_val): status="COMPLETABLE" # Can be completed now
-             except Exception as e: status = f"ACTIVE(ChkERR:{e})"
-         else: status = "ACTIVE(ReqERR)" # Indicate req calculation failed
-    else:
-         if req_val is not None: # Check if req_val was successfully calculated
-             try:
-                 if chal['check_func'](g,req_val): status="COMPLETABLE(Not Active)"
-             except Exception: pass # Ignore check error here, just means WIP
-         # If req_val is None, status remains "WIP"
-    comp_s=f"({lvl}/{max_lvl})" if max_lvl is not None else f"({lvl})"
-    restrict = chal.get('restrictions_desc', 'N/A'); reset_lvl = chal.get('reset_level', 'ascension')
-    return f"{cid.upper()}: {chal['desc_base']} {comp_s} [{status}]\nReq: {req_d}\nRew: {rew_d}\nRestrict: {restrict} | Reset: {reset_lvl}"
-
+    if len(args)!=1: return "Usage: getchal <id (e.g., c1)>"
+    cid=args[0].lower();
+    if cid not in CHALLENGES: return f"Error: Challenge '{cid}' not found."
+    chal_data=CHALLENGES[cid]; comps=g.chal_comps.get(cid,0); maxc=chal_data.get('mc')
+    is_maxed = (maxc is not None and comps >= maxc); status = "Not Started"
+    if g.active_chal == cid: status = "ACTIVE"
+    elif is_maxed: status = "MAXED"
+    elif comps > 0: status = "In Progress"
+    req_desc = "???"; reward_desc = "???"
+    try: req_val = chal_data['rf'](g, comps); req_desc = chal_data['rd'](req_val)
+    except Exception as e: req_desc = f"ReqError:{e}"
+    try: reward_level = comps if is_maxed else comps + 1; reward_desc = chal_data['rwd'](g, reward_level)
+    except Exception as e: reward_desc = f"RewardError:{e}"
+    comp_str = f"({comps}/{maxc})" if maxc is not None else f"({comps})"
+    restrictions = chal_data.get('restr','N/A'); reset_level = chal_data.get('rl','asc').capitalize()
+    return (f"--- Chal {cid.upper()} [{status}] ---\nDesc: {chal_data['db']} {comp_str}\nReq: {req_desc}\n"
+            f"Reward: {reward_desc}\nRestrict: {restrictions}\nReset: {reset_level}")
 def cmd_setchal(args):
-    global g; logf=log_to_admin_output_threadsafe
+    logf = log_admin_ts;
     if len(args)!=2: return "Usage: setchal <id> <count>"
     try:
-        cid=args[0].lower()
-        if cid not in CHALLENGES: return f"Error: Chal ID '{cid}' not found."
-        count=int(args[1]); assert count>=0
-        max_c = CHALLENGES[cid].get('max_completions')
-        if max_c is not None and count > max_c: logf(f"Warn: Setting {count} > max {max_c}. Clamping."); count = max_c
-        old_count = g.chal_comps.get(cid, 0); g.chal_comps[cid]=count
-        recalculate_derived_values()
-        logf(f"NOTE: Set chal '{cid}' comps to {count}. Recalculated.")
-        logf(f"NOTE: Does NOT retroactively apply level-based rewards {old_count+1}..{count}.")
-        return f"Set chal '{cid}' comps to {count}. Recalculated."
+        cid=args[0].lower(); count=int(args[1]); assert count>=0
+        if cid not in CHALLENGES: return f"Error: Challenge '{cid}' not found."
+        maxc = CHALLENGES[cid].get('mc')
+        if maxc is not None and count > maxc: logf(f"Warn: Clamping {count} > max {maxc}."); count = maxc
+        g.chal_comps[cid] = count; logf(f"ADMIN NOTE: Set '{cid}' comps to {count}. No retro rewards. Use applychalrewards.");
+        recalculate_derived_values() # Update derived values affected by completion count
+        return f"Set chal '{cid}' completions to {count}."
+    except (ValueError, AssertionError) as e: return f"SetChal Err: Invalid count - {e}"
     except Exception as e: return f"SetChal Error: {e}"
-
+def cmd_applychalrewards(args):
+    logf = log_admin_ts; cid_filter = args[0].lower() if args else None; applied_count = 0
+    logf("Applying challenge rewards based on current completions...")
+    g.chal_sd_bst = 1.0; g.chal_perm_clk_bst = 1.0; g.r3_cst_m = 1.0; g.chal_upg_cst_scale_mult = 1.0 # Reset reward vars
+    for cid, chal_data in CHALLENGES.items():
+        if cid_filter and cid != cid_filter: continue
+        completions = g.chal_comps.get(cid, 0)
+        if completions > 0:
+             apply_func = chal_data.get('arf')
+             if apply_func:
+                 try: apply_func(g); logf(f"Applied '{cid}' rewards ({completions} comps)."); applied_count += 1
+                 except Exception as e: logf(f"Err applying '{cid}' reward: {e}")
+             else: logf(f"Warn: No reward func ('arf') for '{cid}'.")
+    if applied_count > 0: recalculate_derived_values(); return f"Applied rewards for {applied_count} challenges. Recalculated."
+    else: return "No challenge rewards applied."
 def cmd_resetchal(args):
-    global g; logf=log_to_admin_output_threadsafe
-    if len(args) != 1: return "Usage: resetchal <id|all>"
-    target = args[0].lower()
-    if target == 'all':
-        if not g.chal_comps: return "No chal comps to reset."
-        g.chal_comps.clear(); recalculate_derived_values()
-        logf("NOTE: All chal comps reset to 0. Recalculated."); return "Reset all chal comps."
-    elif target in CHALLENGES:
-        if target in g.chal_comps:
-            del g.chal_comps[target]; recalculate_derived_values()
-            logf(f"NOTE: Reset chal '{target}' comps to 0. Recalculated."); return f"Reset chal '{target}' comps."
-        else: return f"Chal '{target}' already 0 comps."
-    else: return f"Error: Unknown chal ID '{target}'."
-
+    logf = log_admin_ts;
+    if len(args)!=1: return "Usage: resetchal <id | all>"
+    target_id = args[0].lower()
+    if target_id == 'all':
+        if not g.chal_comps: return "No challenge completions to reset."
+        g.chal_comps.clear(); cmd_applychalrewards([]); recalculate_derived_values()
+        logf("Reset all chal comps and re-applied rewards."); return "Reset all challenge completions."
+    elif target_id in CHALLENGES:
+        if target_id in g.chal_comps:
+            del g.chal_comps[target_id]; cmd_applychalrewards([]); recalculate_derived_values()
+            logf(f"Reset chal '{target_id}' and re-applied all rewards."); return f"Reset completions for '{target_id}'."
+        else: return f"Challenge '{target_id}' already 0."
+    else: return f"Error: Unknown challenge ID '{target_id}'."
 def cmd_forcechal(args):
-    global g
-    if len(args) < 1: return "Usage: forcechal <enter|exit> [id]"
+    if len(args)<1: return "Usage: forcechal <enter|exit> [id]"
     action = args[0].lower()
     if action == 'enter':
-        if len(args) != 2: return "Usage: forcechal enter <id>"
-        cid = args[1].lower() 
-        if cid not in CHALLENGES: return f"Error: Unknown chal ID '{cid}'"
-        if g.active_chal: return f"Error: Already in chal '{g.active_chal}'"
-        reset_for_challenge(cid); return f"Forced entry into challenge '{cid}'."
+        if len(args)!=2: return "Usage: forcechal enter <id>"; cid = args[1].lower()
+        if cid not in CHALLENGES: return f"Err: Unknown chal '{cid}'"
+        if g.active_chal: return f"Err: Already in chal '{g.active_chal}'. Exit first."
+        reset_for_challenge(cid); updateui(); return f"Forced entry into chal '{cid}'."
     elif action == 'exit':
-        if not g.active_chal: return "Error: Not in a challenge."
-        exiting_chal = g.active_chal # Store ID before exiting
-        exit_challenge(); return f"Forced exit from challenge '{exiting_chal}'."
-    else: return "Error: Unknown action: 'enter' or 'exit'."
-
+        if not g.active_chal: return "Err: Not in chal."; exiting_chal = g.active_chal; exit_challenge()
+        return f"Forced exit from chal '{exiting_chal}'."
+    else: return "Err: Unknown action. Use 'enter' or 'exit'."
 def cmd_completechal(args):
-    global g
-    if len(args)!=0: return "Usage: completechal (Completes active challenge)"
-    if not g.active_chal: return "Error: Not in a challenge."
-    cid = g.active_chal; chal_data = CHALLENGES.get(cid)
-    if not chal_data: return f"Error: Active challenge '{cid}' invalid."
-    lvl = g.chal_comps.get(cid, 0); max_lvl = chal_data.get('max_completions')
-    if max_lvl is not None and lvl >= max_lvl: return f"Chal '{cid}' already maxed."
-    complete_challenge(cid); return f"Attempted force completion of '{cid}'."
-
+    if len(args)!=0: return "Usage: completechal"
+    if not g.active_chal: return "Err: Not in chal."; cid=g.active_chal; chal_data=CHALLENGES.get(cid)
+    if not chal_data: exit_challenge(); return f"Err: Invalid active chal '{cid}'. Exited."
+    comps=g.chal_comps.get(cid,0); maxc=chal_data.get('mc')
+    if maxc is not None and comps >= maxc: return f"Chal '{cid}' maxed."
+    complete_challenge(cid); return f"Force complete '{cid}' (Lvl {g.chal_comps.get(cid, '??')})."
 def cmd_help(args):
-    global COMMAND_HANDLERS; text="Available Admin Commands:\n"
-    h=COMMAND_HANDLERS; main_cmds=sorted([c for c,d in h.items() if 'alias' not in d])
-    for c in main_cmds: text += f"  {c:<15} {h[c]['help']}\n"
-    aliases=sorted([c for c,d in h.items() if 'alias' in d])
+    h = COMMAND_HANDLERS; help_text = "Admin Console Commands:\n";
+    main_cmds = sorted([c for c, d in h.items() if 'alias' not in d])
+    aliases = sorted([c for c, d in h.items() if 'alias' in d])
+    max_len = 0;
+    if main_cmds: max_len = max(len(c) for c in main_cmds)
+    if aliases: max_len = max(max_len, max(len(c) for c in aliases))
+    for c in main_cmds: help_text += f"  {c:<{max_len}}  {h[c]['help']}\n"
     if aliases:
-        text+="\nAliases:\n"
-        for c in aliases:
-             original_cmd = next((k for k, v in h.items() if v['func'] == h[c]['func'] and 'alias' not in v), "???")
-             text += f"  {c:<15} Alias for '{original_cmd}'\n"
-    return text.strip()
-
-def _wait_thread_func(s,tid):
-    global active_admin_threads; logf=log_to_admin_output_threadsafe
-    logf(f"[{tid}] wait: Starting {s}s sleep...")
-    try: time.sleep(s); logf(f"[{tid}] wait: Finished.")
-    except Exception as e: logf(f"[{tid}] wait Error: {e}")
+        help_text += "\nAliases:\n";
+        for c in aliases: target = next((k for k,v in h.items() if v['func']==h[c]['func'] and 'alias' not in v),'?'); help_text += f"  {c:<{max_len}}  Alias for '{target}'\n"
+    return help_text.strip()
+def _start_admin_thread(target_func, args_tuple, task_id_prefix, log_func):
+    global active_admin_thds; task_id = f"{task_id_prefix}-{random.randint(100,999)}"
+    thread = th.Thread(target=target_func, args=args_tuple + (task_id,), daemon=True)
+    active_admin_thds.append(task_id); thread.start(); log_func(f"ADMIN: Started BG task {task_id}.")
+    return task_id
+def _admin_thread_wrapper(func, *args):
+    task_id = args[-1]; log_func = log_admin_ts; func_args = args[:-1]
+    log_func(f"[{task_id}] Starting...");
+    try: func(*func_args); log_func(f"[{task_id}] Finished.")
+    except Exception as e: log_func(f"[{task_id}] Error: {e}"); logging.error(f"Admin Task [{task_id}] Err: {e}", exc_info=True)
     finally:
-        if tid in active_admin_threads: active_admin_threads.remove(tid)
-
+        if task_id in active_admin_thds: active_admin_thds.remove(task_id); # log_func(f"[{task_id}] Removed.") # Less verbose
+        # else: log_func(f"[{task_id}] Warn: Task ID not found on completion.")
+def _wait_task(seconds_to_wait): time.sleep(seconds_to_wait)
 def cmd_wait(args):
-    global active_admin_threads
-    if len(args)!=1: return "Usage: wait <secs>"
-    try:
-        s=float(args[0]); assert s>=0; tid=f"wait-{random.randint(1000,9999)}"
-        t=th.Thread(target=_wait_thread_func,args=(s,tid),daemon=True); active_admin_threads.append(tid); t.start()
-        return f"wait: BG wait started (TID {tid})."
-    except: return "Error: Invalid time specified."
-
-def _repeat_thread_func(t,cmd,tid):
-    global active_admin_threads,is_running; logf=log_to_admin_output_threadsafe
-    logf(f"[{tid}] repeat: Starting '{cmd}' x{t}..."); executed_count=0
-    try:
-        for i in range(t):
-            if not is_running: logf(f"[{tid}] repeat: Cancelled."); break
-            _execute_single_command(cmd,log_output=False); executed_count+=1; time.sleep(0.05)
-        logf(f"[{tid}] repeat: Finished {executed_count}/{t}.")
-    except Exception as e: logf(f"[{tid}] repeat: Error on rep {executed_count+1}: {e}")
-    finally:
-        if tid in active_admin_threads: active_admin_threads.remove(tid)
-
+    if len(args)!=1: return "Usage: wait <seconds>"
+    try: s = float(args[0]); assert s>=0; task_id = _start_admin_thread(_admin_thread_wrapper, (_wait_task, s), "wait", log_admin_ts); return f"wait: Started BG wait {task_id} for {s}s."
+    except: return "Error: Invalid time."
+def _repeat_task(times, command_str):
+    logf = log_admin_ts; executed_count = 0
+    for i in range(times):
+        if not is_running: logf(f"repeat: Game stopped. Halting after {executed_count}/{times}."); break
+        _exec_cmd(command_str, False); executed_count += 1; time.sleep(0.05)
 def cmd_repeat(args):
-    global active_admin_threads
-    if len(args)<2: return "Usage: repeat <times> <cmd...>"
-    try:
-        t=int(args[0]); assert t>0; cmd=" ".join(args[1:])
-        if not cmd: return "Error: No command to repeat."
-        tid=f"repeat-{random.randint(1000,9999)}"
-        thrd=th.Thread(target=_repeat_thread_func,args=(t,cmd,tid),daemon=True); active_admin_threads.append(tid); thrd.start()
-        return f"repeat: BG repeat started (TID {tid})."
-    except: return "Error: Invalid times specified."
-
-def _while_thread_func(cond,cmd,tid):
-    global active_admin_threads,is_running; logf=log_to_admin_output_threadsafe
-    logf(f"[{tid}] while: Starting loop '{cond}' -> '{cmd}'..."); iterations=0; max_iterations=10000
-    try:
-        while is_running and _evaluate_condition(cond) and iterations < max_iterations:
-            iterations+=1; _execute_single_command(cmd,log_output=False); time.sleep(0.1)
-        if not is_running: logf(f"[{tid}] while: Cancelled.")
-        elif iterations>=max_iterations: logf(f"[{tid}] while: Max iters ({max_iterations}).")
-        else: logf(f"[{tid}] while: Cond false. Finished {iterations} iters.")
-    except Exception as e: logf(f"[{tid}] while: Error iter {iterations+1}: {e}"); logging.error(f"[{tid}] while: {e}",exc_info=True)
-    finally:
-        if tid in active_admin_threads: active_admin_threads.remove(tid)
-
+    if len(args)<2: return "Usage: repeat <times> <command...>"
+    try: t = int(args[0]); assert t>0; cmd = " ".join(args[1:]); task_id = _start_admin_thread(_admin_thread_wrapper, (_repeat_task, t, cmd), "repeat", log_admin_ts); return f"repeat: Started BG repeat {task_id} ('{cmd}' x{t})."
+    except: return "Error: Invalid times."
+def _while_task(condition_str, command_str):
+    logf = log_admin_ts; iterations = 0; max_iterations = 10000
+    while is_running and iterations < max_iterations:
+        if _eval_cond(condition_str): _exec_cmd(command_str, False); iterations += 1; time.sleep(0.1)
+        else: logf(f"while: Cond '{condition_str}' false. Stop."); break
+    else:
+        if iterations >= max_iterations: logf(f"while: Max iter ({max_iterations}). Stop.")
 def cmd_while(args):
-    global active_admin_threads
-    if len(args)<4: return "Usage: while <var op val> <cmd...>"
-    try:
-        condition_str=" ".join(args[0:3]); command_str=" ".join(args[3:])
-        initial_check = _evaluate_condition(condition_str)
-        if not command_str: return "Error: No command specified."
-        tid=f"while-{random.randint(1000,9999)}"
-        thrd=th.Thread(target=_while_thread_func,args=(condition_str,command_str,tid),daemon=True); active_admin_threads.append(tid); thrd.start()
-        return f"while: BG loop started (TID {tid}). Init: {initial_check}."
-    except Exception as e: return f"Error setting up while: {e}"
-
+    if len(args)<4 or args[1].lower() not in ['==','!=','>','<','>=','<=','is','is not']: return "Usage: while <var> <op> <val> <command...>"
+    try: condition = " ".join(args[0:3]); command = " ".join(args[3:]); initial_check = _eval_cond(condition); task_id = _start_admin_thread(_admin_thread_wrapper, (_while_task, condition, command), "while", log_admin_ts); return f"while: Started BG loop {task_id}. Cond ('{condition}') init {initial_check}."
+    except Exception as e: return f"Error setup while: {e}"
 def cmd_setrelic(args):
-    global g
-    if len(args) != 2: return "Usage: setrelic <id> <lvl>"
-    rid, lvl_s = args[0].lower(), args[1]
-    if rid not in RELICS_DATA: return f"Error: Unknown relic '{rid}'."
-    try: lvl = int(lvl_s); assert lvl >= 0
-    except: return "Error: Lvl must be non-neg int."
-    max_l = RELICS_DATA[rid].get('max_level', RELIC_MAX_LEVEL)
-    if max_l is not None and lvl > max_l: return f"Error: Max lvl {max_l}."
-    g.relic_lvls[rid] = lvl; recalculate_derived_values(); return f"Set relic '{rid}' to {lvl}. Recalculated."
-
+    if len(args)!=2: return "Usage: setrelic <id> <level>"; relic_id, level_str = args[0].lower(), args[1]
+    if relic_id not in RELICS_DATA: return f"Error: Relic ID '{relic_id}' not found."
+    try: level = int(level_str); assert level >= 0
+    except: return "Error: Invalid level."
+    max_level = RELICS_DATA[relic_id].get('max_level', RELIC_MAX_LEVEL)
+    if max_level is not None and level > max_level: return f"Error: Level {level} exceeds max {max_level}."
+    g.relic_lvls[relic_id] = level; recalculate_derived_values(); return f"Set relic '{relic_id}' to {level}. Recalc."
 def cmd_listrelics(args):
-    global g; output = "--- Relics ---\n"; owned_relics = g.relic_lvls
+    output = "--- Relics ---\n"; owned = g.relic_lvls
     if not RELICS_DATA: return "No relics defined."
-    all_relic_ids = sorted(list(RELICS_DATA.keys()))
-    for rid in all_relic_ids:
-        data = RELICS_DATA[rid]; lvl=owned_relics.get(rid, 0); owned_str = "(Owned)" if rid in owned_relics else "(Not Owned)"
-        max_l=data.get('max_level', RELIC_MAX_LEVEL)
-        l_str=f"Lvl: {lvl}/{max_l}" if max_l is not None else f"Lvl: {lvl}"
-        output += f"{rid} [{data.get('name','Unknown')}]: {l_str} {owned_str}\n"
+    for rid in sorted(list(RELICS_DATA.keys())):
+        d = RELICS_DATA[rid]; lvl = owned.get(rid, 0); owned_m = "(Owned)" if lvl > 0 else ""; ml = d.get('max_level', RELIC_MAX_LEVEL)
+        ls = f"Lvl:{lvl}/{ml}" if ml is not None else f"Lvl:{lvl}"; eff = get_relic_effect(rid, '?'); eff_s = format_number(eff) if eff != '?' else '?'
+        output += f"{rid} [{d.get('name','???')}]: {ls} {owned_m} (Eff: {eff_s})\n" # Show effect
     return output.strip()
-
 def cmd_resetrelics(args):
-    global g
-    if not g.relic_lvls: return "No relic levels to reset."
-    g.relic_lvls.clear(); recalculate_derived_values(); return "Relic levels reset. Recalculated."
+    if not g.relic_lvls: return "No relics owned."
+    g.relic_lvls.clear(); recalculate_derived_values(); return "Relics reset. Recalc."
 
 COMMAND_HANDLERS = {
-    'set': {'func': cmd_setvalue, 'help': '<var> <val> - Set variable (applies prestige buffs)'},
-    'get': {'func': cmd_varinfo, 'help': '<var> - Get variable info (value & type)'},
-    'type': {'func': cmd_type, 'help': '<var> - Get variable type'},
-    'list': {'func': cmd_list, 'help': '[<var>] - List all vars or info for one var'},
-    'limbrk': {'func': cmd_limbrk, 'help': '<upgX|name|all> - Set _max level(s) to infinity'},
-    'settype': {'func': cmd_settype, 'help': '<var> <type> - Attempt type conversion (int,float,str,bool,dict,list)'},
-    'buy': {'func': cmd_buy, 'help': '<id> [times] - Buy upg/action/relic X times (checks restrictions)'},
-    'imprint': {'func': cmd_imprint, 'help': '<var> <val> - Set value, apply buffs, save game'},
-    'stop': {'func': cmd_stop, 'help': "[nosave] - Stop game ('stop nosave' to skip save)"},
-    'offline': {'func': cmd_offline, 'help': '<secs> - Simulate offline time (50% gains)'},
-    'recalc': {'func': cmd_recalc, 'help': '- Force recalculation of derived stats'},
-    'reset': {'func': cmd_reset, 'help': '<type> - Reset progress (purify|cryst|asc|save)'},
-    'help': {'func': cmd_help, 'help': '- Show this help message'},
-    'getchal': {'func': cmd_getchal, 'help': '<id> - Get challenge details and status'},
-    'setchal': {'func': cmd_setchal, 'help': '<id> <count> - Set challenge *completion count* (rewards update on recalc)'},
-    'resetchal': {'func': cmd_resetchal, 'help': '<id|all> - Reset challenge *completion count* to 0 (rewards update on recalc)'},
-    'forcechal': {'func': cmd_forcechal, 'help': '<enter|exit> [id] - Force enter/exit challenge (bypasses checks)'},
-    'completechal': {'func': cmd_completechal, 'help': '- Force complete the currently active challenge'},
-    'wait': {'func': cmd_wait, 'help': '<secs> - Pause command execution (background)'},
-    'repeat': {'func': cmd_repeat, 'help': '<times> <cmd...> - Repeat command (background)'},
-    'while': {'func': cmd_while, 'help': '<var op val> <cmd...> - Loop command while condition true (background)'},
-    'setrelic': {'func': cmd_setrelic, 'help': '<id> <level> - Set relic level'},
-    'listrelics': {'func': cmd_listrelics, 'help': '- List all relics (owned and defined) and levels'},
-    'resetrelics': {'func': cmd_resetrelics, 'help': '- Reset all relic levels to 0'},
-    'setvalue': {'func': cmd_setvalue, 'help': 'Alias for set', 'alias': True}, # Example Alias
-    'varinfo': {'func': cmd_varinfo, 'help': 'Alias for get', 'alias': True},   # Example Alias
+    'set': {'func': cmd_setvalue, 'help': '<v> <val> Set var'}, 'get': {'func': cmd_varinfo, 'help': '<v> Get var info'},
+    'type': {'func': cmd_type, 'help': '<v> Get var type'}, 'list': {'func': cmd_list, 'help': '[f] List vars'},
+    'limbrk': {'func': cmd_limbrk, 'help': '<n|all> Set _max inf'}, 'settype': {'func': cmd_settype, 'help': '<v> <t> Set type'},
+    'buy': {'func': cmd_buy, 'help': '<id> [t] Buy item'}, 'imprint': {'func': cmd_imprint, 'help': '<v> <val> Set & save'},
+    'stop': {'func': cmd_stop, 'help': "[nosave] Stop game"}, 'offline': {'func': cmd_offline, 'help': '<secs> Sim offline'},
+    'recalc': {'func': cmd_recalc, 'help': '- Force recalc'}, 'reset': {'func': cmd_reset, 'help': '<type> Reset progress'},
+    'help': {'func': cmd_help, 'help': '- Show help'}, 'getchal': {'func': cmd_getchal, 'help': '<id> Get chal details'},
+    'setchal': {'func': cmd_setchal, 'help': '<id> <c> Set chal comps'}, 'applychalrewards': {'func': cmd_applychalrewards, 'help': '[id] Apply rewards'},
+    'resetchal': {'func': cmd_resetchal, 'help': '<id|all> Reset chal comps'}, 'forcechal': {'func': cmd_forcechal, 'help': '<in|out> [id] Force chal state'},
+    'completechal': {'func': cmd_completechal, 'help': '- Force complete active chal'}, 'wait': {'func': cmd_wait, 'help': '<s > Wait secs (BG)'},
+    'repeat': {'func': cmd_repeat, 'help': '<t> <cmd> Repeat (BG)'}, 'while': {'func': cmd_while, 'help': '<cond> <cmd> Loop (BG)'},
+    'setrelic': {'func': cmd_setrelic, 'help': '<id> <lvl> Set relic lvl'}, 'listrelics': {'func': cmd_listrelics, 'help': '- List relics'},
+    'resetrelics': {'func': cmd_resetrelics, 'help': '- Reset relics'},
+    'setvalue': {'func': cmd_setvalue, 'help': '-> set', 'alias': True}, 'varinfo': {'func': cmd_varinfo, 'help': '-> get', 'alias': True},
 }
-
 def admin_execute_command(event=None):
-    if not DEVELOPER_MODE or not admin_widgets.get('cmd_input'): return
-    cmd_text=admin_widgets['cmd_input'].get().strip()
-    if not cmd_text: return
-    admin_widgets['cmd_input'].delete(0,tk.END)
-    log_to_admin_output(f"> {cmd_text}")
-    _execute_single_command(cmd_text, log_output=True)
-
-def log_to_admin_output(msg):
-    """Logs a message to the admin output widget (must run on main thread)."""
-    if th.current_thread() is not th.main_thread():
-        log_to_admin_output_threadsafe(msg)
-        return
-
-    output_widget = admin_widgets.get('cmd_output')
+    if not DEVELOPER_MODE or not admin_wdgs.get('cmd_input'): return
+    cmd_string=admin_wdgs['cmd_input'].get().strip();
+    if not cmd_string: return
+    admin_wdgs['cmd_input'].delete(0,tk.END); log_admin(f"> {cmd_string}"); _exec_cmd(cmd_string, True)
+def log_admin(msg):
+    if th.current_thread() is not th.main_thread(): log_admin_ts(msg); return
+    output_widget=admin_wdgs.get('cmd_output')
     if output_widget and window and window.winfo_exists():
         try:
-            # --- Attempt to get the underlying tk.Text widget ---
-            # ttkbootstrap.scrolled.ScrolledText often stores the text widget
-            # in an attribute named 'text'. Check for its existence.
-            text_widget_to_configure = None
-            if hasattr(output_widget, 'text') and isinstance(output_widget.text, tk.Text):
-                text_widget_to_configure = output_widget.text
-                # logging.debug("Configuring internal 'text' widget.") # Optional debug log
-            elif isinstance(output_widget, tk.Text): # Maybe it IS the Text widget directly?
-                 text_widget_to_configure = output_widget
-                 # logging.debug("Configuring widget directly (assumed tk.Text).") # Optional
-            elif isinstance(output_widget, scrolledtext.ScrolledText): # Handle tkinter fallback
-                 # tkinter.scrolledtext *is* the frame, the text is internal, but configure might be forwarded?
-                 # Let's try configuring the wrapper first for the fallback case.
-                 # If this fails, one might need to dig deeper into ScrolledText internals, but
-                 # configure *should* work.
-                 text_widget_to_configure = output_widget
-                 # logging.debug("Configuring tkinter.scrolledtext directly.") # Optional
-
-            if text_widget_to_configure is None:
-                # Fallback if we couldn't find the text widget - configure the main widget
-                # This might be the source of the error if output_widget isn't a Text widget
-                # or doesn't properly delegate the state config.
-                text_widget_to_configure = output_widget
-                logging.warning("Could not reliably find internal Text widget, configuring main output_widget.")
-
-
-            # --- Configure the identified widget ---
-            # Use the 'state=' keyword argument, which is correct syntax.
-            text_widget_to_configure.configure(state=tk.NORMAL)
-            text_widget_to_configure.insert(tk.END, str(msg)+"\n")
-            text_widget_to_configure.configure(state=tk.DISABLED)
-
-            # Scroll the main ScrolledText widget (if different) or the text widget itself
-            # ScrolledText handles scrolling automatically usually when inserting at END
-            # but calling see() on the text widget is also common.
-            text_widget_to_configure.see(tk.END)
-
-        except tk.TclError as e:
-             # Log specific TclErrors if they still occur
-             logging.warning(f"TclError logging to admin output (widget: {type(output_widget)}, configuring: {type(text_widget_to_configure)}): {e}")
-             pass # Avoid crashing the application
-        except Exception as e:
-             logging.warning(f"Failed to log to admin output (widget: {type(output_widget)}): {e}")
-             pass # Avoid crashing the application
-
+            text_widget = output_widget.text if hasattr(output_widget, 'text') else output_widget
+            current_state = text_widget['state']
+            text_widget.configure(state=tk.NORMAL)
+            text_widget.insert(tk.END, str(msg) + "\n")
+            text_widget.configure(state=tk.DISABLED)
+            text_widget.see(tk.END)
+        except tk.TclError: pass
+        except Exception as e: logging.warning(f"log_admin UI update failed: {e}")
 def open_admin_panel():
-    global admin_window, admin_widgets, g
-    if not DEVELOPER_MODE: logging.warning("Admin disabled."); return
+    global admin_window, admin_wdgs, g
+    if not DEVELOPER_MODE: return
     if admin_window and admin_window.winfo_exists():
         try: admin_window.lift(); admin_window.focus_force(); return
-        except tk.TclError: admin_window=None
-    g.admin_panel_active=True
-    admin_window=ttk.Toplevel(window); admin_window.title("Admin Console"); admin_window.geometry("700x500")
-    admin_window.protocol("WM_DELETE_WINDOW", on_admin_close)
-    main_frame=ttk.Frame(admin_window,padding=10); main_frame.pack(expand=True,fill=tk.BOTH)
-    main_frame.grid_rowconfigure(0,weight=1); main_frame.grid_columnconfigure(0,weight=1)
-    output_area=ttkScrolledText(main_frame,height=20,wrap=tk.WORD,state=tk.DISABLED,autohide=True, font=("Consolas", 10))
-    output_area.grid(row=0,column=0,sticky='nsew',padx=5,pady=5); admin_widgets['cmd_output']=output_area
-    input_entry=ttk.Entry(main_frame,font=("Consolas",10))
-    input_entry.grid(row=1,column=0,sticky='ew',padx=5,pady=(5,10)); admin_widgets['cmd_input']=input_entry
-    input_entry.bind("<Return>",admin_execute_command); input_entry.focus_set()
-    log_to_admin_output("Admin console initialized. Type 'help' for commands.")
-
+        except: admin_window=None
+    g.admin_panel_active=True; admin_window=ttk.Toplevel(window); admin_window.title("Admin Console"); admin_window.geometry("700x500"); admin_window.protocol("WM_DELETE_WINDOW", on_admin_close)
+    main_frame=ttk.Frame(admin_window, padding=10); main_frame.pack(expand=True, fill=tk.BOTH); main_frame.grid_rowconfigure(0, weight=1); main_frame.grid_columnconfigure(0, weight=1)
+    output_area = ttkScrolledText(main_frame, height=20, wrap=tk.WORD, state=tk.DISABLED, autohide=True, font=("Consolas", 10)); output_area.grid(row=0, column=0, sticky='nsew', padx=5, pady=5); admin_wdgs['cmd_output'] = output_area
+    input_entry = ttk.Entry(main_frame, font=("Consolas", 10)); input_entry.grid(row=1, column=0, sticky='ew', padx=5, pady=(5,10)); input_entry.bind("<Return>", admin_execute_command); admin_wdgs['cmd_input'] = input_entry; input_entry.focus_set(); log_admin("Admin Console Ready. Type 'help'.")
 def on_admin_close():
-    global admin_window, admin_widgets, g, active_admin_threads
+    global admin_window, admin_wdgs, g, active_admin_thds
     if not DEVELOPER_MODE: return
     g.admin_panel_active=False
-    if active_admin_threads: log_to_admin_output(f"Closing admin. {len(active_admin_threads)} BG tasks may continue.")
+    if active_admin_thds: log_admin(f"Closing admin panel. {len(active_admin_thds)} BG task(s) remain.")
     if admin_window:
         try: admin_window.destroy()
         except: pass
-    admin_window=None; admin_widgets.clear(); logging.info("Admin panel closed.")
-
-def admin_recalculate(): log_to_admin_output("> recalc"); result = cmd_recalc([]); log_to_admin_output(result)
-
+    admin_window=None; admin_wdgs.clear(); logging.info("Admin panel closed.")
 
 # ==============================================================================
 #                           UI SETUP
 # ==============================================================================
-# --- UI Helper Functions ---
 def create_label(parent, text, row, col, **kwargs):
     grid_opts = {k: kwargs.pop(k) for k in list(kwargs.keys()) if k in ['sticky', 'padx', 'pady', 'columnspan', 'rowspan']}
     grid_opts.setdefault('sticky', 'w'); grid_opts.setdefault('padx', 5); grid_opts.setdefault('pady', 2)
@@ -3044,135 +2060,272 @@ def create_label(parent, text, row, col, **kwargs):
 def create_button(parent, text, command, row, col, **kwargs):
     grid_opts = {k: kwargs.pop(k) for k in list(kwargs.keys()) if k in ['sticky', 'padx', 'pady', 'columnspan', 'rowspan']}
     grid_opts.setdefault('sticky', 'ew'); grid_opts.setdefault('padx', 5); grid_opts.setdefault('pady', 5)
-    bootstyle = kwargs.pop('bootstyle', 'primary-outline'); width = kwargs.pop('width', 10)
-    btn = ttk.Button(parent, text=text, command=command, bootstyle=bootstyle, width=width, **kwargs)
+    style = kwargs.pop('bootstyle', 'primary-outline'); width = kwargs.pop('width', 10)
+    btn = ttk.Button(parent, text=text, command=command, bootstyle=style, width=width, **kwargs)
     btn.grid(row=row, column=col, **grid_opts)
     return btn
 
-# --- Main Window and Notebook ---
+# --- Main Window ---
 window = ttk.Window(themename="darkly"); window.title("Ordinal Ascent II"); window.geometry("1000x700")
 window.grid_rowconfigure(0, weight=1); window.grid_columnconfigure(0, weight=1)
-notebook = ttk.Notebook(window, bootstyle="primary"); notebook.grid(row=0, column=0, sticky='nsew', padx=10, pady=10)
 
-# --- Create Frames ---
-prestige_frame = ttk.Frame(notebook, padding=(20, 10)); upgrades_frame = ttk.Frame(notebook, padding=(20, 10))
-clicking_frame = ttk.Frame(notebook, padding=(20, 10)); ascension_frame = ttk.Frame(notebook, padding=(20, 10))
-relics_frame = ttk.Frame(notebook, padding=(20,10)); challenges_frame = ttk.Frame(notebook, padding=(20, 10))
+# --- Notebook (Tabs) ---
+notebook_ref = ttk.Notebook(window, bootstyle="primary"); notebook_ref.grid(row=0, column=0, sticky='nsew', padx=10, pady=10)
+tab_frames = {} # Reset for population
 
-# --- Configure Frame Grids ---
-prestige_frame.grid_columnconfigure((0,3), weight=1); upgrades_frame.grid_columnconfigure(1, weight=1)
-upgrades_frame.grid_columnconfigure(3, weight=0); clicking_frame.grid_columnconfigure(1, weight=1)
-clicking_frame.grid_rowconfigure(1, weight=1); ascension_frame.grid_columnconfigure(0, weight=1)
-relics_frame.grid_columnconfigure(1, weight=1); challenges_frame.grid_columnconfigure(0, weight=1)
-challenges_frame.grid_rowconfigure(1, weight=0); challenges_frame.grid_rowconfigure(2, weight=1)
+# Define frames and unlock checks
+pres_f = ttk.Frame(notebook_ref, padding=(20,10)); tab_frames[0] = (pres_f, lambda: True, " Prestige ")
+upg_f = ttk.Frame(notebook_ref, padding=(20,10)); tab_frames[1] = (upg_f, lambda: True, " Upgrades ")
+clk_f = ttk.Frame(notebook_ref, padding=(20,10)); tab_frames[2] = (clk_f, lambda: g.cr4_unl, " Clicking ")
+asc_f = ttk.Frame(notebook_ref, padding=(20,10)); tab_frames[3] = (asc_f, lambda: g.asc_unl, " Ascension ")
+relic_f = ttk.Frame(notebook_ref, padding=(20,10)); tab_frames[4] = (relic_f, lambda: g.asc_first, " Relics ")
+chal_f = ttk.Frame(notebook_ref, padding=(20,10)); tab_frames[5] = (chal_f, lambda: g.asc_first, " Challenges ")
+celest_f = ttk.Frame(notebook_ref, padding=(20,10)); tab_frames[6] = (celest_f, lambda: g.celest_unl, " Celestiality ")
+stats_f = ttk.Frame(notebook_ref, padding=(10,10)); tab_frames[7] = (stats_f, lambda: True, " Statistics ")
+help_f = ttk.Frame(notebook_ref, padding=(0,0)); tab_frames[8] = (help_f, lambda: True, " Help ")
 
-# --- Add Frames to Notebook ---
-notebook.add(prestige_frame, text=" Prestige "); notebook.add(upgrades_frame, text=" Upgrades ")
-notebook.add(clicking_frame, text=" Clicking "); notebook.add(ascension_frame, text=" Ascension ")
-notebook.add(relics_frame, text=" Relics "); notebook.add(challenges_frame, text=" Challenges ")
+# Add tabs using the defined frames and names
+for i in range(len(tab_frames)):
+    frame, _, base_name = tab_frames[i]
+    notebook_ref.add(frame, text=base_name) # Add with base name initially
 
-# --- Populate Tabs ---
-# Prestige Tab
-purificationlabel=create_label(prestige_frame,"...",0,0,columnspan=2,sticky='ew',wraplength=350)
-purificationbutton=create_button(prestige_frame,"Purify",purify,1,0,columnspan=2)
-ttk.Separator(prestige_frame,orient=VERTICAL).grid(row=0,column=2,rowspan=2,sticky='ns',padx=20)
-crystalinelabel=create_label(prestige_frame,"...",0,3,columnspan=2,sticky='ew',wraplength=350)
-crystalinebutton=create_button(prestige_frame,"Crystalline",crystalline,1,3,columnspan=2)
-# Upgrades Tab
-pointlabel=create_label(upgrades_frame,"Pts: ...",0,0,columnspan=4); ppslabel=create_label(upgrades_frame,"PPS: ...",1,0,columnspan=4)
-ttk.Separator(upgrades_frame,orient=HORIZONTAL).grid(row=2,column=0,columnspan=4,sticky='ew',pady=10)
-create_label(upgrades_frame,"Upg1:",3,0,sticky='e',font=('-weight','bold')); upgrade1costlabel=create_label(upgrades_frame,"Cost: ...",3,1); button1=create_button(upgrades_frame,"Buy",upgrade1,3,2,width=5); upgrade1explainlabel=create_label(upgrades_frame,"Effect: ...",4,1,columnspan=2)
-create_label(upgrades_frame,"Upg2:",5,0,sticky='e',font=('-weight','bold')); upgrade2costlabel=create_label(upgrades_frame,"Cost: ...",5,1); button2=create_button(upgrades_frame,"Buy",upgrade2,5,2,width=5); upgrade2explainlabel=create_label(upgrades_frame,"Effect: ...",6,1,columnspan=2)
-create_label(upgrades_frame,"Upg3:",7,0,sticky='e',font=('-weight','bold')); upgrade3costlabel=create_label(upgrades_frame,"Cost: ...",7,1); button3=create_button(upgrades_frame,"Buy",upgrade3,7,2,width=5); upgrade3explainlabel=create_label(upgrades_frame,"Effect: ...",8,1,columnspan=2)
-create_label(upgrades_frame,"Upg4:",9,0,sticky='e',font=('-weight','bold')); upgrade4costlabel=create_label(upgrades_frame,"Cost: ...",9,1); button4=create_button(upgrades_frame,"Buy",upgrade4,9,2,width=5); upgrade4explainlabel=create_label(upgrades_frame,"Effect: ...",10,1,columnspan=2)
-# Clicking Tab
-clicklabel=create_label(clicking_frame,"Clicks: ...",0,0,columnspan=2,sticky='ew',anchor=tk.CENTER)
-clickbutton=create_button(clicking_frame,"Click!",click_power_action,1,0,columnspan=2,rowspan=2,sticky='nsew',pady=20)
-ttk.Separator(clicking_frame,orient=HORIZONTAL).grid(row=3,column=0,columnspan=2,sticky='ew',pady=15)
-create_label(clicking_frame,"Upg5:",4,0,sticky='e',font=('-weight','bold')); upgrade5costlabel=create_label(clicking_frame,"Cost: ...",4,1); button5=create_button(clicking_frame,"Buy",upgrade5,5,0); upgrade5explainlabel=create_label(clicking_frame,"Effect: ...",5,1)
-create_label(clicking_frame,"Upg6:",6,0,sticky='e',font=('-weight','bold')); upgrade6costlabel=create_label(clicking_frame,"Cost: ...",6,1); button6=create_button(clicking_frame,"Buy",upgrade6,7,0); upgrade6explainlabel=create_label(clicking_frame,"Effect: ...",7,1)
-create_label(clicking_frame,"Upg7:",8,0,sticky='e',font=('-weight','bold')); upgrade7costlabel=create_label(clicking_frame,"Cost: ...",8,1); button7=create_button(clicking_frame,"Buy",upgrade7,9,0); upgrade7explainlabel=create_label(clicking_frame,"Effect: ...",9,1)
-create_label(clicking_frame,"Upg8:",10,0,sticky='e',font=('-weight','bold')); upgrade8costlabel=create_label(clicking_frame,"Cost: ...",10,1); button8=create_button(clicking_frame,"Buy",upgrade8,11,0); upgrade8explainlabel=create_label(clicking_frame,"Effect: ...",11,1)
-# Ascension Tab
-stardustlabel=create_label(ascension_frame,"Stardust: 0",0,0,columnspan=2,sticky='ew',font=('-weight','bold'))
-asc_lvl_label = create_label(ascension_frame, "Ascension Level: 0", 1, 0, columnspan=2, sticky='ew')
-asc_prog_label = create_label(ascension_frame, "XP: 0 / 1000 (0.0%)", 2, 0, columnspan=2, sticky='ew')
-ascensionlabel=create_label(ascension_frame,"Ascension Locked",3,0,columnspan=2,sticky='ew',wraplength=400)
-ascensionbutton=create_button(ascension_frame,"Ascend",ascend,4,0,columnspan=2)
-# Relics Tab
-relic_title = create_label(relics_frame, "Relics (Spend Stardust)", 0, 0, columnspan=3, sticky='ew', font=('-weight','bold'))
-rr=1
+# Configure Frame Grids
+pres_f.grid_columnconfigure((0,3),weight=1); pres_f.grid_rowconfigure(0, weight=0)
+upg_f.grid_columnconfigure(1,weight=1); upg_f.grid_columnconfigure(3,weight=0);
+clk_f.grid_columnconfigure(1,weight=1); clk_f.grid_rowconfigure(1,weight=1);
+asc_f.grid_columnconfigure(0,weight=1); asc_f.grid_rowconfigure(4, weight=1) # Label row 4 expands now
+relic_f.grid_columnconfigure(1,weight=1);
+chal_f.grid_columnconfigure(0,weight=1); chal_f.grid_rowconfigure(2,weight=1)
+celest_f.grid_columnconfigure(0,weight=1); celest_f.grid_rowconfigure(1, weight=1)
+stats_f.grid_columnconfigure(0,weight=1); stats_f.grid_rowconfigure(0, weight=1)
+
+# === Populate Prestige Tab ===
+purlbl=create_label(pres_f,"...",0,0,columnspan=2,sticky='ew',wraplength=350); purbtn=create_button(pres_f,"Purify",purify,1,0,columnspan=2)
+ttk.Separator(pres_f,orient=VERTICAL).grid(row=0,column=2,rowspan=2,sticky='ns',padx=20)
+crylbl=create_label(pres_f,"...",0,3,columnspan=2,sticky='ew',wraplength=350); crybtn=create_button(pres_f,"Crystalline",crystalline,1,3,columnspan=2)
+
+# === Populate Upgrades Tab ===
+ptslbl=create_label(upg_f,"Pts: ...",0,0,columnspan=4); ppslbl=create_label(upg_f,"PPS: ...",1,0,columnspan=4)
+ttk.Separator(upg_f,orient=HORIZONTAL).grid(row=2,column=0,columnspan=4,sticky='ew',pady=10)
+create_label(upg_f,"Upg1:",3,0,sticky='e',font=('-weight','bold')); upg1cstlbl=create_label(upg_f,"C:...",3,1,sticky='w'); btn1=create_button(upg_f,"Buy",upgrade1,3,2,width=5); upg1explbl=create_label(upg_f,"E:...",4,1,columnspan=2, sticky='w')
+create_label(upg_f,"Upg2:",5,0,sticky='e',font=('-weight','bold')); upg2cstlbl=create_label(upg_f,"C:...",5,1,sticky='w'); btn2=create_button(upg_f,"Buy",upgrade2,5,2,width=5); upg2explbl=create_label(upg_f,"E:...",6,1,columnspan=2, sticky='w')
+create_label(upg_f,"Upg3:",7,0,sticky='e',font=('-weight','bold')); upg3cstlbl=create_label(upg_f,"C:...",7,1,sticky='w'); btn3=create_button(upg_f,"Buy",upgrade3,7,2,width=5); upg3explbl=create_label(upg_f,"E:...",8,1,columnspan=2, sticky='w')
+create_label(upg_f,"Upg4:",9,0,sticky='e',font=('-weight','bold')); upg4cstlbl=create_label(upg_f,"C:...",9,1,sticky='w'); btn4=create_button(upg_f,"Buy",upgrade4,9,2,width=5); upg4explbl=create_label(upg_f,"E:...",10,1,columnspan=2, sticky='w')
+
+# === Populate Clicking Tab ===
+clkslbl=create_label(clk_f,"Clk:...",0,0,columnspan=2,sticky='ew',anchor=tk.CENTER); clkbtn=create_button(clk_f,"Click!",click_power_action,1,0,columnspan=2,rowspan=2,sticky='nsew',pady=20)
+ttk.Separator(clk_f,orient=HORIZONTAL).grid(row=3,column=0,columnspan=2,sticky='ew',pady=15)
+create_label(clk_f,"Upg5:",4,0,sticky='e',font=('-weight','bold')); upg5cstlbl=create_label(clk_f,"C:...",4,1); btn5=create_button(clk_f,"Buy",upgrade5,5,0, width=5); upg5explbl=create_label(clk_f,"E:...",5,1)
+create_label(clk_f,"Upg6:",6,0,sticky='e',font=('-weight','bold')); upg6cstlbl=create_label(clk_f,"C:...",6,1); btn6=create_button(clk_f,"Buy",upgrade6,7,0, width=5); upg6explbl=create_label(clk_f,"E:...",7,1)
+create_label(clk_f,"Upg7:",8,0,sticky='e',font=('-weight','bold')); upg7cstlbl=create_label(clk_f,"C:...",8,1); btn7=create_button(clk_f,"Buy",upgrade7,9,0, width=5); upg7explbl=create_label(clk_f,"E:...",9,1)
+create_label(clk_f,"Upg8:",10,0,sticky='e',font=('-weight','bold')); upg8cstlbl=create_label(clk_f,"C:...",10,1); btn8=create_button(clk_f,"Buy",upgrade8,11,0, width=5); upg8explbl=create_label(clk_f,"E:...",11,1)
+
+# === Populate Ascension Tab ===
+sdlbl=create_label(asc_f,"SD: 0",0,0,columnspan=2,sticky='ew',font=('-weight','bold')); asclvllbl=create_label(asc_f,"AscLvl:0",1,0,columnspan=2,sticky='ew'); ascproglbl=create_label(asc_f,"XP:0/1K(0%)",2,0,columnspan=2,sticky='ew')
+ttk.Separator(asc_f, orient=HORIZONTAL).grid(row=3, column=0, columnspan=2, sticky='ew', pady=10)
+asclbl=create_label(asc_f,"Asc Locked",4,0,columnspan=2,sticky='nsew',wraplength=400); ascbtn=create_button(asc_f,"Ascend",ascend,5,0,columnspan=2)
+
+# === Populate Relics Tab ===
+relic_title_lbl=create_label(relic_f,"Relics",0,0,columnspan=3,sticky='ew',font=('-weight','bold'))
+relic_row_counter=1
 for rid,data in RELICS_DATA.items():
-    nl=create_label(relics_frame,data['name'],rr,0,sticky='e',font=('-weight','bold')); dl=create_label(relics_frame,data['desc'],rr,1,sticky='w',wraplength=300)
-    ll=create_label(relics_frame,"Lvl: 0",rr+1,1,sticky='w'); cl=create_label(relics_frame,"Cost: ...",rr+2,1,sticky='w')
-    bb=create_button(relics_frame,"Buy",lambda r=rid:buy_relic(r),rr,2,rowspan=3,sticky='ewns'); relic_widgets[rid]=(nl,dl,ll,cl,bb); rr+=3
-    for w in relic_widgets[rid]: w.grid_remove() # Initially hidden
-relic_title.grid_remove()
-# Challenges Tab
-create_label(challenges_frame,"Challenges",0,0,sticky='ew',font=('-weight','bold'))
-exit_challenge_button = create_button(challenges_frame, "Exit Challenge", exit_challenge, 1, 0, sticky='ew', bootstyle="danger-outline")
-exit_challenge_button.grid_remove()
-challenge_scroll_frame = ttk.Frame(challenges_frame); challenge_scroll_frame.grid(row=2, column=0, sticky='nsew', pady=(10,0))
-challenge_scroll_frame.grid_rowconfigure(0, weight=1); challenge_scroll_frame.grid_columnconfigure(0, weight=1)
-challenge_canvas = tk.Canvas(challenge_scroll_frame, borderwidth=0, highlightthickness=0) # Remove border
-challenge_list_frame = ttk.Frame(challenge_canvas); challenge_scrollbar = ttk.Scrollbar(challenge_scroll_frame, orient="vertical", command=challenge_canvas.yview, bootstyle="round")
-challenge_canvas.configure(yscrollcommand=challenge_scrollbar.set); challenge_scrollbar.grid(row=0, column=1, sticky='ns'); challenge_canvas.grid(row=0, column=0, sticky='nsew')
-challenge_canvas_window = challenge_canvas.create_window((0, 0), window=challenge_list_frame, anchor="nw")
-def _configure_challenge_list_frame(event): challenge_canvas.configure(scrollregion=challenge_canvas.bbox("all"))
-def _configure_challenge_canvas(event): challenge_canvas.itemconfig(challenge_canvas_window, width=event.width)
-challenge_list_frame.bind("<Configure>", _configure_challenge_list_frame); challenge_canvas.bind('<Configure>', _configure_challenge_canvas)
-challenge_list_frame.grid_columnconfigure(0, weight=1)
-cr=0
-for cid,chal in CHALLENGES.items():
-    chal_frame = ttk.Frame(challenge_list_frame, padding=(5, 5), borderwidth=1, relief="solid")
-    chal_frame.grid(row=cr, column=0, sticky='ew', pady=5); chal_frame.grid_columnconfigure(0, weight=1); chal_frame.grid_columnconfigure(1, weight=0)
-    cl=create_label(chal_frame,f"...",0,0,sticky='nw',wraplength=550)
-    cb=create_button(chal_frame,f"Enter C{cid[1:]}",lambda c=cid: enter_challenge(c),0,1,sticky='ne'); challenge_widgets[cid]=(cl, cb); cr+=1
+    nl=create_label(relic_f, data['name'], relic_row_counter, 0, sticky='e', font=('-weight','bold'))
+    dl=create_label(relic_f, data['desc'], relic_row_counter, 1, sticky='w', wraplength=300)
+    ll=create_label(relic_f, "L:0", relic_row_counter + 1, 1, sticky='w')
+    cl=create_label(relic_f, "C:...", relic_row_counter + 2, 1, sticky='w')
+    bb=create_button(relic_f, "Buy", lambda r=rid: buy_relic(r), relic_row_counter, 2, rowspan=3, sticky='ewns', width=5)
+    relic_wdgs[rid]=(nl, dl, ll, cl, bb); relic_row_counter += 3
+    # Widgets start hidden, shown by updateui if g.asc_first
 
-# Admin Button
+# === Populate Challenges Tab ===
+chal_frame = ttk.Frame(chal_f); chal_frame.grid(row=0, column=0, sticky='nsew'); chal_frame.grid_columnconfigure(0, weight=1); chal_frame.grid_rowconfigure(2, weight=1)
+create_label(chal_frame,"Challenges",0,0,sticky='ew',font=('-weight','bold')); exitchalbtn=create_button(chal_frame,"Exit Challenge",exit_challenge,1,0,sticky='ew',bootstyle="danger-outline")
+chal_scroll_outer_f=ttk.Frame(chal_frame); chal_scroll_outer_f.grid(row=2,column=0,sticky='nsew',pady=(10,0)); chal_scroll_outer_f.grid_rowconfigure(0,weight=1); chal_scroll_outer_f.grid_columnconfigure(0,weight=1)
+chal_cvs=tk.Canvas(chal_scroll_outer_f, borderwidth=0, highlightthickness=0); chal_scr=ttk.Scrollbar(chal_scroll_outer_f, orient="vertical", command=chal_cvs.yview, bootstyle="round"); chal_cvs.configure(yscrollcommand=chal_scr.set)
+chal_list_f=ttk.Frame(chal_cvs); chal_list_f.grid_columnconfigure(0, weight=1)
+chal_cvs.grid(row=0,column=0,sticky='nsew'); chal_scr.grid(row=0,column=1,sticky='ns'); chal_cvs_win=chal_cvs.create_window((0,0), window=chal_list_f, anchor="nw")
+chal_list_f.bind("<Configure>", lambda e: chal_cvs.configure(scrollregion=chal_cvs.bbox("all"))); chal_cvs.bind('<Configure>', lambda e: chal_cvs.itemconfig(chal_cvs_win, width=e.width))
+current_chal_row=0
+for cid,chal_data in CHALLENGES.items():
+    cf=ttk.Frame(chal_list_f, padding=5, borderwidth=1, relief="solid"); cf.grid(row=current_chal_row, column=0, sticky='ew', pady=5); cf.grid_columnconfigure(0,weight=1); cf.grid_columnconfigure(1,weight=0)
+    cl=create_label(cf,"...",0,0,sticky='nw',wraplength=550); cb=create_button(cf,f"Enter C{cid[1:]}",lambda c=cid:enter_challenge(c),0,1,sticky='ne'); chal_wdgs[cid]=(cl,cb); current_chal_row+=1
+# Frame starts hidden, shown by updateui if g.asc_first
+
+# === Populate Celestiality Tab ===
+nf_lbl = create_label(celest_f, "Nebula Fragments: 0", 0, 0, columnspan=2, sticky='ew', font=('-weight','bold'))
+celestlbl = create_label(celest_f, "Celestiality Locked", 1, 0, columnspan=2, sticky='nsew', wraplength=400)
+celestbtn = create_button(celest_f, "Perform Celestiality", celestiality, 2, 0, columnspan=2)
+# Widgets start hidden, shown by updateui if g.celest_unl
+
+# === Populate Statistics Tab ===
+stats_text = ttkScrolledText(stats_f, wrap=tk.WORD, state=tk.DISABLED, font=("Consolas", 10), autohide=True)
+stats_text.grid(row=0, column=0, sticky='nsew', padx=5, pady=5)
+
+# === Populate Help Tab ===
+help_pane = PanedWindow(help_f, orient=tk.HORIZONTAL, sashrelief=tk.RAISED, showhandle=True, handlesize=10)
+help_pane.pack(fill=tk.BOTH, expand=True)
+help_nav_f = ttk.Frame(help_pane, padding=(10, 10)); help_pane.add(help_nav_f) # No weight
+help_nav_f.grid_columnconfigure(0, weight=1)
+help_text_f = ttk.Frame(help_pane, padding=(5, 5)); help_pane.add(help_text_f) # No weight
+help_text_f.grid_rowconfigure(0, weight=1); help_text_f.grid_columnconfigure(0, weight=1)
+help_text = ttkScrolledText(help_text_f, wrap=tk.WORD, state=tk.DISABLED, font=("TkDefaultFont", 10), autohide=True)
+help_text.grid(row=0, column=0, sticky='nsew')
+_active_help_topic = None
+def show_help(topic):
+    global _active_help_topic, help_text, help_buttons
+    if not help_text or not help_buttons: return
+    if _active_help_topic and _active_help_topic in help_buttons and help_buttons[_active_help_topic].winfo_exists():
+         # Check if the previously active button is still unlocked before resetting style
+         is_unlocked_prev = False
+         try: # Add try-except for safety during update/state checks
+             if help_buttons[_active_help_topic].cget('state') != tk.DISABLED:
+                 is_unlocked_prev = True
+         except tk.TclError: pass # Widget might not exist anymore
+         update_button_style(help_buttons[_active_help_topic], "primary" if is_unlocked_prev else "locked")
+
+    _active_help_topic = topic; content = "Help topic not found."; unlocked = False
+    # Determine unlock status based on game state
+    if topic == 'points': unlocked = True
+    elif topic == 'purify': unlocked = g.pur_cnt > 0 or g.cryst_unl or g.asc_unl or g.celest_unl
+    elif topic == 'crystalline': unlocked = g.cryst_cnt > 0 or g.asc_unl or g.celest_unl
+    elif topic == 'clicking': unlocked = g.cr4_unl
+    elif topic == 'ascension': unlocked = g.asc_first
+    elif topic == 'relics': unlocked = g.asc_first
+    elif topic == 'challenges': unlocked = g.asc_first
+    elif topic == 'celestiality': unlocked = g.celest_unl
+
+    if unlocked:
+        content = HELP_CONTENT.get(topic, "Help content missing.")
+        if topic in help_buttons and help_buttons[topic].winfo_exists(): update_button_style(help_buttons[topic], "info")
+    else: content = "Unlock this feature to view help."
+    try:
+        help_text.state = tk.NORMAL
+        help_text.delete('1.0', tk.END)
+        help_text.insert('1.0', content)
+        help_text.state = tk.DISABLED
+        help_text.see('1.0') # Scroll to the top of the help text
+    except tk.TclError: pass # Ignore errors if widget destroyed during update
+help_row = 0; help_topics_order = ['points', 'purify', 'crystalline', 'clicking', 'ascension', 'relics', 'challenges', 'celestiality']
+for topic in help_topics_order:
+    if topic in HELP_CONTENT:
+        btn_text = topic.replace('_', ' ').title(); btn = create_button(help_nav_f, btn_text, lambda t=topic: show_help(t), row=help_row, col=0, sticky='ew', width=15); help_buttons[topic] = btn; help_row += 1
+# Initial help view deferred to after load_game()
+
+# === Admin Button ===
 if DEVELOPER_MODE:
-    admin_button=ttk.Button(window,text="Admin",command=open_admin_panel,bootstyle="info-outline")
-    admin_button.grid(row=1,column=0,sticky='sw',padx=10,pady=5)
+    admin_btn=ttk.Button(window,text="A",command=open_admin_panel,bootstyle="info-outline", width=2)
+    admin_btn.place(relx=0.0, rely=1.0, x=5, y=-5, anchor='sw') # Bottom Left
 
 # ==============================================================================
 #                             INITIALIZATION & MAIN LOOP
 # ==============================================================================
 load_game()
-logging.info("Starting threads...")
-game_thread=th.Thread(target=game_loop_thread_func,daemon=True); game_thread.start()
-save_thread=th.Thread(target=autosave_thread_func,daemon=True); save_thread.start()
+logging.info("Starting game threads...")
+game_thd=th.Thread(target=game_loop_thread_func,daemon=True); game_thd.start()
+save_thd=th.Thread(target=autosave_thread_func,daemon=True); save_thd.start()
 start_autobuy_thread_if_needed()
-updateui()
 
-def on_closing(save=True):
-    global is_running, admin_window, active_admin_threads
+# Ensure the initial help topic is displayed after loading the game state
+if help_text and HELP_CONTENT: # Ensure widget and content exist
+    # Default to 'points' topic, but check if it should be shown
+    initial_topic_to_show = 'points'
+    show_help(initial_topic_to_show)
+
+updateui() # Initial UI update (will handle initial help view and tab names)
+
+if stats_text and stats_text.winfo_exists():
+    stats_content = "--- Game State ---\n"
+    # ... (rest of stats_content generation) ...
+    stats_content += f"Limit Break (p20_lim_brk): {g.p20_lim_brk}\n"
+    stats_content += f"Active Challenge (active_chal): {g.active_chal}\n"
+
+    try:
+            current_state = stats_text.state
+            stats_text.state = tk.NORMAL
+            stats_text.delete('1.0', tk.END)
+            stats_text.insert('1.0', stats_content)
+            stats_text.state = tk.DISABLED
+            stats_text.see('1.0') # Scroll to top for stats
+    except tk.TclError: pass # Ignore errors if widget is destroyed
+
+
+# --- Help Tab ---
+# Help tab should always be visible, update button states/text
+    if help_buttons and help_text:
+        for topic, button in help_buttons.items():
+            if not button or not button.winfo_exists(): continue # Added check for button existence
+            unlocked = False
+            if topic == 'points': unlocked = True
+            elif topic == 'purify': unlocked = g.pur_cnt > 0 or g.cryst_unl or g.asc_unl or g.celest_unl
+            elif topic == 'crystalline': unlocked = g.cryst_cnt > 0 or g.asc_unl or g.celest_unl
+            elif topic == 'clicking': unlocked = g.cr4_unl
+            elif topic == 'ascension': unlocked = g.asc_first
+            elif topic == 'relics': unlocked = g.asc_first
+            elif topic == 'challenges': unlocked = g.asc_first
+            elif topic == 'celestiality': unlocked = g.celest_unl
+
+            btn_text = topic.replace('_', ' ').title()
+            # Use try-except for configure as well, just in case
+            try:
+                button.configure(text=btn_text if unlocked else obfuscate(btn_text))
+
+                if _active_help_topic == topic:
+                        # Keep active style if unlocked, otherwise force locked style
+                        update_button_style(button, "info" if unlocked else "locked")
+                else:
+                        # Set normal or locked style
+                        update_button_style(button, "primary" if unlocked else "locked")
+            except tk.TclError: pass # Ignore if button destroyed
+
+        # Schedule next update
+        if is_running: window.after(UPDATE_INTERVAL_MS, updateui)
+
+
+# === Admin Button ===
+if DEVELOPER_MODE:
+    admin_btn=ttk.Button(window,text="A",command=open_admin_panel,bootstyle="info-outline", width=2)
+    admin_btn.place(relx=0.0, rely=1.0, x=5, y=-5, anchor='sw') # Bottom Left
+
+# ==============================================================================
+#                             INITIALIZATION & MAIN LOOP
+# ==============================================================================
+load_game()
+logging.info("Starting game threads...")
+game_thd=th.Thread(target=game_loop_thread_func,daemon=True); game_thd.start()
+save_thd=th.Thread(target=autosave_thread_func,daemon=True); save_thd.start()
+start_autobuy_thread_if_needed()
+updateui() # Initial UI update (will handle initial help view and tab names)
+
+def on_closing(save_on_exit=True):
+    global is_running, admin_window, active_admin_thds;
     if not is_running: return
-    logging.info("Shutdown initiated...")
-    is_running=False
+    logging.info("Shutdown sequence initiated..."); is_running=False
     if admin_window and admin_window.winfo_exists(): on_admin_close()
-    timeout=0.3; threads=[t for t in [game_thread, save_thread, autobuy_thread] if t and t.is_alive()]
-    if threads:
-        logging.debug(f"Waiting for threads ({len(threads)})..."); start=time.monotonic()
-        for t in threads: t.join(timeout)
-        logging.debug(f"Join attempt finished in {time.monotonic()-start:.2f}s.")
-    if active_admin_threads: logging.info(f"Note: {len(active_admin_threads)} admin threads active.")
-    if save: save_game()
+    shutdown_timeout=0.5
+    threads_to_join = [t for t in [game_thd, save_thd, autobuy_thd] if t and t.is_alive()]
+    if threads_to_join:
+        logging.debug(f"Waiting up to {shutdown_timeout}s for {len(threads_to_join)} threads...")
+        start_join = time.monotonic()
+        for t in threads_to_join:
+            remaining_time = shutdown_timeout - (time.monotonic() - start_join)
+            if remaining_time > 0: t.join(timeout=remaining_time)
+            else: break
+    if active_admin_thds: logging.info(f"Note: {len(active_admin_thds)} admin BG task(s) may still be running.")
+    if save_on_exit: save_game(); logging.info("Final save completed.")
     else: logging.info("Skipping final save.")
     try:
         if window and window.winfo_exists(): window.destroy()
-    except tk.TclError: logging.warning("Window already destroyed (TclError).")
-    except Exception as e: logging.error(f"Window destroy error: {e}")
+    except Exception as e: logging.error(f"Error destroying main window: {e}")
     logging.info("Shutdown complete."); logging.shutdown()
 
-window.protocol("WM_DELETE_WINDOW", on_closing)
-
+window.protocol("WM_DELETE_WINDOW", lambda: on_closing(True))
 try:
     window.mainloop()
 except KeyboardInterrupt:
-    logging.info("KeyboardInterrupt received.")
-    on_closing()
+    logging.info("KeyboardInterrupt. Shutting down...")
+    on_closing(True)
 except Exception as e:
     logging.critical(f"Unhandled exception in main loop: {e}", exc_info=True)
-    on_closing(save=False)
+    on_closing(False) # Don't save on crash
 
 # --- END OF FILE ---
